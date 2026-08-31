@@ -24,6 +24,7 @@ use crate::{
         hw_accel,
         session::{TranscodeSession, TranscodeState},
     },
+    services::StreamService,
 };
 
 /// Serializes the lookup-or-create-transcode sequence per play_session_id so
@@ -170,20 +171,20 @@ async fn create_hls_session(
                         .db,
                 )
                 .await?;
-            resolved_media = if let Some(wanted) = q.media_source_id {
-                sources
-                    .iter()
-                    .find(|s| s.id == wanted)
-                    .cloned()
-            } else {
-                None
-            }
-            .or_else(|| {
-                sources
-                    .into_iter()
-                    .next()
-            })
-            .context_not_found("no playable source found")?;
+            let explicitly_requested = q
+                .media_source_id
+                .and_then(|wanted| {
+                    sources
+                        .iter()
+                        .find(|s| s.id == wanted)
+                        .cloned()
+                });
+            resolved_media = match explicitly_requested {
+                Some(source) => source,
+                None => StreamService::default_source(&state.ctx, sources)
+                    .await
+                    .context_not_found("no playable source found")?,
+            };
         } else if resolved_media.kind == db::MediaKind::Track {
             let sources = resolved_media
                 .streams(

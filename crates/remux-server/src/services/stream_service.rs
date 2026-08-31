@@ -241,40 +241,50 @@ impl StreamService {
                     .streams(&ctx.db)
                     .await?;
                 if let Some(sid) = requested_id.filter(|&sid| sid != item_id) {
-                    sources
+                    return sources
                         .into_iter()
                         .find(|s| s.id == sid)
-                        .ok_or_else(|| anyhow::anyhow!("stream not found: {}", sid))
-                } else if let Some(key) = device_key {
+                        .ok_or_else(|| anyhow::anyhow!("stream not found: {}", sid));
+                }
+                if let Some(key) = device_key {
                     let saved = ctx
                         .store
                         .get::<Uuid>(&format!("pstream:{}:{}", item_id, key));
-                    let by_pref = saved.and_then(|sid| {
+                    if let Some(preferred) = saved.and_then(|sid| {
                         sources
                             .iter()
                             .find(|s| s.id == *sid)
                             .cloned()
-                    });
-                    by_pref
-                        .or_else(|| {
-                            sources
-                                .into_iter()
-                                .next()
-                        })
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("no playable sources for {}", item_id)
-                        })
-                } else {
-                    sources
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("no playable sources for {}", item_id)
-                        })
+                    }) {
+                        return Ok(preferred);
+                    }
                 }
+                Self::default_source(ctx, sources)
+                    .await
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no playable sources for {}", item_id)
+                    })
             }
             _ => Ok(media),
         }
+    }
+
+    pub(crate) async fn default_source(
+        ctx: &AppContext,
+        sources: Vec<db::Media>,
+    ) -> Option<db::Media> {
+        let show_ungrouped = db::Settings::get_config_or_default(&ctx.db)
+            .await
+            .stream_groups_show_ungrouped
+            .unwrap_or(true);
+        let fallback = sources
+            .first()
+            .cloned();
+        db::StreamGroup::filter_sources(&ctx.db, sources, show_ungrouped)
+            .await
+            .into_iter()
+            .next()
+            .or(fallback)
     }
 
     async fn resolve_stream_group(&mut self, media: db::Media) -> anyhow::Result<()> {
@@ -860,4 +870,62 @@ fn media_info_from_probe(
         external_ids,
         tracks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        integration_test::new_test_server,
+        stream::{StreamDescriptor, StreamInfo},
+    };
+    use remux_sdks::remux::{
+        FilterMatchMode, SetOp, StreamFilter, StreamResolution, StreamRule,
+    };
+
+    fn source(filename: &str) -> db::Media {
+        db::Media {
+            id: Uuid::new_v4(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::default(),
+                filename: Some(filename.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_source_uses_stream_group_order_before_raw_order() {
+        let (_server, guard) = new_test_server()
+            .await
+            .unwrap();
+        let group = db::StreamGroup::create(
+            &guard
+                .0
+                .db,
+            "Preferred",
+            StreamFilter {
+                match_mode: FilterMatchMode::All,
+                rules: vec![StreamRule::Resolution {
+                    op: SetOp::In,
+                    values: vec![StreamResolution::R1080p],
+                }],
+            },
+            0,
+        )
+        .await
+        .unwrap();
+        let raw_first = source("Movie.720p.WEB-DL.mkv");
+        let preferred = source("Movie.1080p.WEB-DL.mkv");
+
+        let selected =
+            StreamService::default_source(&guard.0, vec![raw_first, preferred.clone()])
+                .await
+                .unwrap();
+
+        assert_eq!(selected.id, preferred.id);
+        assert_eq!(selected.group_id, Some(group.id));
+    }
 }
