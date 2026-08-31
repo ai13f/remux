@@ -1,3 +1,4 @@
+use super::MediaResolveService;
 use crate::{
     AppContext, api, db,
     playback::probe::{probe_stream, resolve_stream_root},
@@ -199,7 +200,8 @@ impl StreamService {
 
     /// One-shot lookup for handlers that only need a single resolved stream (subtitles, video).
     ///
-    /// Handles StreamGroup → best candidate, device preference, and explicit stream UUID.
+    /// Canonicalizes transient addon result IDs before resolving StreamGroup
+    /// parents, device preferences, or explicit stream UUIDs.
     /// Returns the concrete `db::Media` to stream.
     pub async fn lookup(
         ctx: &AppContext,
@@ -209,11 +211,26 @@ impl StreamService {
         user_id: Option<Uuid>,
     ) -> anyhow::Result<db::Media> {
         let lookup_id = requested_id.unwrap_or(item_id);
-        let media = db::Media::get_by_id(&ctx.db, &lookup_id)
+        let media = MediaResolveService::resolve_item(lookup_id, ctx)
             .await?
             .ok_or_else(|| anyhow::anyhow!("stream not found: {}", lookup_id))?;
-        Self::dispatch_lookup(ctx, item_id, requested_id, device_key, user_id, media)
-            .await
+        let canonical_item_id = if lookup_id == item_id {
+            media.id
+        } else {
+            MediaResolveService::resolve_item(item_id, ctx)
+                .await?
+                .map_or(item_id, |item| item.id)
+        };
+        let canonical_requested_id = requested_id.map(|_| media.id);
+        Self::dispatch_lookup(
+            ctx,
+            canonical_item_id,
+            canonical_requested_id,
+            device_key,
+            user_id,
+            media,
+        )
+        .await
     }
 
     async fn dispatch_lookup(

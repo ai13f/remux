@@ -180,17 +180,25 @@ async fn items_playbackinfo_inner(
             .context_forbidden("media playback is disabled"));
     }
 
-    let media =
-        MediaResolveService::resolve_item(media_source_id.unwrap_or(id), &state.ctx)
+    let item_media = MediaResolveService::resolve_item(id, &state.ctx)
+        .await?
+        .context_not_found("not found")?;
+    let item_id = item_media.id;
+    let media = if media_source_id.is_some_and(|source_id| source_id != id) {
+        MediaResolveService::resolve_item(media_source_id.unwrap(), &state.ctx)
             .await?
-            .context_not_found("not found")?;
+            .context_not_found("not found")?
+    } else {
+        item_media
+    };
+    let requested_id = media_source_id.map(|_| media.id);
 
     let mut service = StreamService::new(StreamServiceConfig {
         ctx: state
             .ctx
             .clone(),
-        item_id: id,
-        requested_id: media_source_id,
+        item_id,
+        requested_id,
         show_ungrouped,
         stream_filter: session
             .user
@@ -214,14 +222,13 @@ async fn items_playbackinfo_inner(
     service
         .load(media)
         .await?;
-    // Load the top-level Movie/Episode for subtitle lookup.
-    // `id` is always the movie/episode UUID; `media_source_id` may point to a
-    // child Source, so we always resolve via `id` to get the IMDB fields.
+    // Load the canonical top-level Movie/Episode for subtitle lookup. Addon
+    // results may arrive under a transient ID that resolves to this stable row.
     let mut subtitle_media = db::Media::get_by_id(
         &state
             .ctx
             .db,
-        &id,
+        &item_id,
     )
     .await
     .ok()
@@ -260,7 +267,7 @@ async fn items_playbackinfo_inner(
         device_profile: device_profile.clone(),
         max_bitrate,
         play_session_id: play_session_id.clone(),
-        item_id: id,
+        item_id,
         subtitle_mode,
     };
 
@@ -303,7 +310,7 @@ async fn items_playbackinfo_inner(
         &session
             .user
             .id,
-        &id,
+        &item_id,
     )
     .await;
 
@@ -501,7 +508,7 @@ async fn items_playbackinfo_inner(
 
         apply_subtitle_delivery(
             &mut source,
-            id,
+            item_id,
             session
                 .device
                 .access_token
@@ -533,7 +540,7 @@ async fn items_playbackinfo_inner(
             &state.ctx,
             sub_media,
             &mut media_sources,
-            id,
+            item_id,
             session
                 .device
                 .access_token
@@ -572,11 +579,12 @@ async fn items_playbackinfo_inner(
     );
 
     // When no specific stream was requested (initial load, or media_source_id == item_id),
-    // override source[0].Id to equal the item ID — clients expect this for auto-play.
-    // Group and specific-stream requests keep their own UUIDs (specific_stream_requested = true).
+    // override source[0].Id to equal the canonical item ID. Addon result IDs can
+    // be transient, while playback routes and stream-group parents require the
+    // stable persisted UUID.
     if !specific_stream_requested && !media_sources.is_empty() {
-        media_sources[0].id = id;
-        media_sources[0].e_tag = id;
+        media_sources[0].id = item_id;
+        media_sources[0].e_tag = item_id;
     }
 
     for (source, (delivery_source_id, routes)) in media_sources
@@ -592,7 +600,7 @@ async fn items_playbackinfo_inner(
                 &session
                     .device
                     .id,
-                id,
+                item_id,
                 source.id,
                 routes.clone(),
             );
@@ -602,7 +610,7 @@ async fn items_playbackinfo_inner(
             &session
                 .device
                 .id,
-            id,
+            item_id,
             delivery_source_id,
             routes,
         );
@@ -629,7 +637,7 @@ async fn items_playbackinfo_inner(
             {
                 source.transcoding_url = Some(format!(
                     "/videos/{}/stream?Static=true&PlaySessionId={}&MediaSourceId={}&ApiKey={}",
-                    id,
+                    item_id,
                     play_session_id,
                     source.id,
                     session
@@ -643,8 +651,8 @@ async fn items_playbackinfo_inner(
 
     let error_code = if media_sources.is_empty() {
         media_sources.push(api::MediaSourceInfo {
-            id,
-            e_tag: id,
+            id: item_id,
+            e_tag: item_id,
             name: Some("No streams found".to_string()),
             protocol: api::MediaProtocol::File,
             supports_direct_play: true,
@@ -3258,6 +3266,88 @@ mod tests {
             "source Path must reference the Blu-ray stream ({}), got: {path}",
             bluray_stream.id
         );
+        let transient_id = uuid::Uuid::new_v4();
+        ctx.store
+            .save(
+                transient_id.to_string(),
+                movie.id,
+                std::time::Duration::from_secs(60),
+            );
+
+        let aliased = server
+            .post(&format!("/items/{transient_id}/playbackinfo"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+        aliased.assert_status_ok();
+        let aliased_body: serde_json::Value = aliased.json();
+        assert_eq!(
+            aliased_body["MediaSources"][0]["Id"]
+                .as_str()
+                .unwrap(),
+            movie
+                .id
+                .simple()
+                .to_string(),
+            "transient addon IDs must not escape into playback routes"
+        );
+
+        let aliased_default = server
+            .post(&format!("/items/{transient_id}/playbackinfo"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({ "MediaSourceId": transient_id.to_string() }))
+            .await;
+        aliased_default.assert_status_ok();
+        let aliased_default_body: serde_json::Value = aliased_default.json();
+        assert_eq!(
+            aliased_default_body["MediaSources"][0]["Id"]
+                .as_str()
+                .unwrap(),
+            movie
+                .id
+                .simple()
+                .to_string(),
+            "a transient MediaSourceId must resolve to the canonical item"
+        );
+
+        let aliased_group = server
+            .post(&format!("/items/{transient_id}/playbackinfo"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({ "MediaSourceId": bluray_group.id.to_string() }))
+            .await;
+        aliased_group.assert_status_ok();
+        let aliased_group_body: serde_json::Value = aliased_group.json();
+        assert!(
+            aliased_group_body["MediaSources"][0]["Path"]
+                .as_str()
+                .unwrap_or("")
+                .contains(
+                    &bluray_stream
+                        .id
+                        .to_string()
+                ),
+            "group selection through a transient item ID must use the canonical parent"
+        );
+
+        let selected = crate::services::StreamService::lookup(
+            ctx,
+            transient_id,
+            Some(bluray_group.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.id, bluray_stream.id);
     }
 
     /// When the client POSTs an explicit `AudioStreamIndex`, language preference
