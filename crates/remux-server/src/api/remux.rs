@@ -445,18 +445,6 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
     )
     .await
     .unwrap_or_default();
-    let enabled_groups: Vec<&db::StreamGroup> = groups
-        .iter()
-        .filter(|g| g.enabled)
-        .collect();
-
-    if enabled_groups.is_empty() {
-        let streams = sources
-            .iter()
-            .map(source_to_dto)
-            .collect();
-        return Ok(StreamsResponse { streams });
-    }
 
     let config = db::Settings::get_config_or_default(
         &state
@@ -468,89 +456,63 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
         .stream_groups_show_ungrouped
         .unwrap_or(true);
 
-    let mut result: Vec<StreamMetadataDto> = vec![];
-    let mut matched_ids: HashSet<Uuid> = HashSet::new();
-
-    for group in &enabled_groups {
-        let matching: Vec<&db::Media> = sources
-            .iter()
-            .filter(|s| {
-                s.stream_info
-                    .as_ref()
-                    .map_or(false, |info| {
-                        group.match_outcome(
-                            info,
-                            s.probe_data
-                                .as_ref(),
-                        ) == db::MatchOutcome::Match
-                    })
-            })
-            .collect();
-
-        if matching.is_empty() {
+    let filtered =
+        db::StreamGroup::filter_sources_for_groups(&groups, sources, show_ungrouped);
+    let mut result = Vec::with_capacity(filtered.len());
+    for source in &filtered {
+        let Some(group_id) = source.group_id else {
+            result.push(source_to_dto(source));
             continue;
-        }
-
-        for s in &matching {
-            matched_ids.insert(s.id);
-        }
-
-        let best = matching[0];
+        };
+        let Some(group) = groups
+            .iter()
+            .find(|group| group.id == group_id)
+        else {
+            continue;
+        };
         let description = {
             use remux_sdks::remux::{StreamRule, format_size_rule, language_label};
             let parts: Vec<String> = group
                 .filter
                 .rules
                 .iter()
-                .map(|r| match r {
+                .map(|rule| match rule {
                     StreamRule::Resolution { values, .. } => values
                         .iter()
-                        .map(|v| v.label())
+                        .map(|value| value.label())
                         .collect::<Vec<_>>()
                         .join("/"),
                     StreamRule::Quality { values, .. } => values
                         .iter()
-                        .map(|v| v.label())
+                        .map(|value| value.label())
                         .collect::<Vec<_>>()
                         .join("/"),
                     StreamRule::Codec { values, .. } => values
                         .iter()
-                        .map(|v| v.label())
+                        .map(|value| value.label())
                         .collect::<Vec<_>>()
                         .join("/"),
                     StreamRule::AudioLanguage { values, .. } => values
                         .iter()
-                        .map(|c| language_label(c))
+                        .map(|code| language_label(code))
                         .collect::<Vec<_>>()
                         .join("/"),
                     StreamRule::Size { op, value } => format_size_rule(*op, *value),
                 })
-                .filter(|s| !s.is_empty())
+                .filter(|part| !part.is_empty())
                 .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join(" · "))
-            }
+            (!parts.is_empty()).then(|| parts.join(" · "))
         };
         result.push(StreamMetadataDto {
-            id: best.id,
+            id: source.id,
             name: Some(group.display_name()),
             description,
             index: result.len() as i64,
-            size: best
+            size: source
                 .probe_data
                 .as_ref()
-                .and_then(|p| p.size),
+                .and_then(|probe| probe.size),
         });
-    }
-
-    if show_ungrouped {
-        for s in &sources {
-            if !matched_ids.contains(&s.id) {
-                result.push(source_to_dto(s));
-            }
-        }
     }
 
     Ok(StreamsResponse { streams: result })

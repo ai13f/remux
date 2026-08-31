@@ -5827,6 +5827,23 @@ impl Media {
                 sources.retain(|s| s.updated_at >= refreshed);
             }
 
+            // Stream rows carry no original_language of their own; inherit
+            // the title's effective language (movie → its own, episode → its
+            // series) so AudioLanguage stream-group rules can fall back to
+            // title-level evidence.
+            if let Some(lang) = self
+                .effective_original_language(db)
+                .await
+            {
+                for s in &mut sources {
+                    if s.original_language
+                        .is_none()
+                    {
+                        s.original_language = Some(lang.clone());
+                    }
+                }
+            }
+
             self.sources = Some(sources);
         };
         Ok(self
@@ -5834,6 +5851,56 @@ impl Media {
             .as_deref()
             .unwrap_or_default()
             .to_vec())
+    }
+
+    /// Effective original language for stream matching: the item's own
+    /// `original_language`, falling back to the series row for episodes
+    /// (TMDB stores the language on movies and series, not episodes).
+    pub async fn effective_original_language(
+        &mut self,
+        db: &sqlx::SqlitePool,
+    ) -> Option<String> {
+        if self
+            .original_language
+            .is_some()
+        {
+            return self
+                .original_language
+                .clone();
+        }
+        if self.kind != MediaKind::Episode {
+            return None;
+        }
+        self.grandparent(db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|gp| {
+                gp.original_language
+                    .clone()
+            })
+    }
+
+    /// Original language of the catalog item (movie or series) matching this
+    /// IMDb id. Used by the stream-group preview, whose stub item has no
+    /// catalog row attached.
+    pub async fn original_language_by_imdb(
+        db: &sqlx::SqlitePool,
+        imdb_id: &str,
+    ) -> Option<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT original_language FROM media \
+             WHERE kind IN ('movie', 'series') \
+               AND original_language IS NOT NULL \
+               AND json_extract(external_ids, '$.imdb') = ? \
+             ORDER BY kind, id \
+             LIMIT 1",
+        )
+        .bind(imdb_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
     }
 
     pub async fn seasons(&mut self, db: &sqlx::SqlitePool) -> Result<Vec<Media>> {

@@ -2,8 +2,8 @@ use anyhow::Result;
 use chrono::Utc;
 use remux_sdks::remux::{
     FilterMatchMode, NumericOp, SetOp, StreamCodec, StreamFilter, StreamQuality,
-    StreamResolution, StreamRule, format_size_rule, language_label,
-    normalize_lang_code,
+    StreamResolution, StreamRule, common_audio_languages, format_size_rule,
+    language_label, normalize_lang_code,
 };
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -236,58 +236,69 @@ impl StreamGroup {
 
     /// Filter a list of media sources by the enabled stream groups.
     ///
-    /// Returns one representative source per matching group (the first
-    /// match by priority order), plus any unmatched sources when
-    /// `show_ungrouped` is true.  When no groups are enabled the original
-    /// list is returned unchanged.
+    /// Returns one representative source per matching group — the best
+    /// candidate on the quality ladder (see [`rank_by_quality`]), ties broken
+    /// by incoming order — plus any unmatched sources when `show_ungrouped`
+    /// is true.  When no groups are enabled the original list is returned
+    /// unchanged.
     pub async fn filter_sources(
         db: &SqlitePool,
         sources: Vec<Media>,
         show_ungrouped: bool,
     ) -> Vec<Media> {
         let groups = match Self::list(db).await {
-            Ok(g) => g,
+            Ok(groups) => groups,
             Err(_) => return sources,
         };
-        let enabled: Vec<&StreamGroup> = groups
+        Self::filter_sources_for_groups(&groups, sources, show_ungrouped)
+    }
+
+    pub(crate) fn filter_sources_for_groups(
+        groups: &[StreamGroup],
+        sources: Vec<Media>,
+        show_ungrouped: bool,
+    ) -> Vec<Media> {
+        let mut result = Vec::new();
+        let mut matched_ids = HashSet::new();
+        let mut any_enabled = false;
+
+        for group in groups
             .iter()
-            .filter(|g| g.enabled)
-            .collect();
-        if enabled.is_empty() {
-            return sources;
-        }
-
-        let mut result: Vec<Media> = vec![];
-        let mut matched_ids: HashSet<Uuid> = HashSet::new();
-
-        for group in &enabled {
-            let matching: Vec<&Media> = sources
+            .filter(|group| group.enabled)
+        {
+            any_enabled = true;
+            let mut matching: Vec<&Media> = sources
                 .iter()
-                .filter(|s| {
-                    s.stream_info
+                .filter(|source| {
+                    source
+                        .stream_info
                         .as_ref()
-                        .map_or(false, |info| {
-                            group.match_outcome(
+                        .is_some_and(|info| {
+                            group.match_outcome_ctx(
                                 info,
-                                s.probe_data
+                                source
+                                    .probe_data
                                     .as_ref(),
+                                source
+                                    .original_language
+                                    .as_deref(),
                             ) == MatchOutcome::Match
                         })
                 })
                 .collect();
-
             if matching.is_empty() {
                 continue;
             }
 
-            for s in &matching {
-                matched_ids.insert(s.id);
-            }
-
+            matched_ids.extend(
+                matching
+                    .iter()
+                    .map(|source| source.id),
+            );
             if !group.hidden {
-                // Only the first (highest-priority) match is shown.
-                // group_id marks it as a group representative; the real stream
-                // UUID stays in best.id so internal probe URLs stay correct.
+                // group_id marks the representative while its real stream UUID
+                // stays in id, keeping internal probe URLs correct.
+                rank_by_quality(&mut matching);
                 let mut best = matching[0].clone();
                 best.title = group.display_name();
                 best.group_id = Some(group.id);
@@ -295,14 +306,16 @@ impl StreamGroup {
             }
         }
 
-        if show_ungrouped {
-            for s in &sources {
-                if !matched_ids.contains(&s.id) {
-                    result.push(s.clone());
-                }
-            }
+        if !any_enabled {
+            return sources;
         }
-
+        if show_ungrouped {
+            result.extend(
+                sources
+                    .into_iter()
+                    .filter(|source| !matched_ids.contains(&source.id)),
+            );
+        }
         result
     }
 }
@@ -332,10 +345,12 @@ pub fn apply_stream_filter(filter: &StreamFilter, sources: Vec<Media>) -> Vec<Me
             s.stream_info
                 .as_ref()
                 .map_or(true, |info| {
-                    temp.match_outcome(
+                    temp.match_outcome_ctx(
                         info,
                         s.probe_data
                             .as_ref(),
+                        s.original_language
+                            .as_deref(),
                     ) != MatchOutcome::NoMatch
                 })
         })
@@ -347,6 +362,18 @@ impl StreamGroup {
         &self,
         info: &StreamInfo,
         probe_data: Option<&crate::api::MediaSourceInfo>,
+    ) -> MatchOutcome {
+        self.match_outcome_ctx(info, probe_data, None)
+    }
+
+    /// Like [`Self::match_outcome`], with the title's effective original
+    /// language (BCP 47 or ISO 639) as last-resort AudioLanguage evidence
+    /// (see [`language_evidence`]).
+    pub fn match_outcome_ctx(
+        &self,
+        info: &StreamInfo,
+        probe_data: Option<&crate::api::MediaSourceInfo>,
+        original_language: Option<&str>,
     ) -> MatchOutcome {
         let filter = &self.filter;
         if filter
@@ -367,28 +394,7 @@ impl StreamGroup {
             None => return MatchOutcome::PassThrough,
         };
 
-        let candidates: Vec<&str> = if raw.contains('\n') {
-            raw.lines()
-                .filter(|l| {
-                    !l.trim()
-                        .is_empty()
-                })
-                .collect()
-        } else {
-            vec![raw]
-        };
-
-        let best = candidates
-            .iter()
-            .map(|s| hunch::hunch(s))
-            .max_by_key(|p| {
-                (p.screen_size()
-                    .is_some() as u8)
-                    + (p.source()
-                        .is_some() as u8)
-            });
-
-        let parsed = match best {
+        let parsed = match best_parse(raw) {
             Some(p) => p,
             None => return MatchOutcome::PassThrough,
         };
@@ -396,14 +402,7 @@ impl StreamGroup {
         let resolution = min_screen_size(&parsed)
             .and_then(StreamResolution::from_hunch)
             .unwrap_or(StreamResolution::Other);
-        let source = {
-            let s = canonical_source(&parsed);
-            if s == StreamQuality::Other {
-                fallback_source(raw)
-            } else {
-                s
-            }
-        };
+        let source = source_of(&parsed, raw);
         let codec = parsed
             .video_codec()
             .and_then(StreamCodec::from_hunch)
@@ -438,37 +437,26 @@ impl StreamGroup {
                     let hit = values.contains(&codec);
                     bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
                 }
-                // No probe data → PassThrough: we can't confirm or deny the
-                // language, so the source must not be absorbed by the group
-                // (which shows only one representative) but also must not be
-                // hidden — it stays visible via the ungrouped list.
-                StreamRule::AudioLanguage { op, values } => match probe_data {
-                    None => MatchOutcome::PassThrough,
-                    Some(pd) => {
-                        let wanted: Vec<String> = values
-                            .iter()
-                            .map(|v| normalize_lang_code(v))
-                            .collect();
-                        let hit = pd
-                            .media_streams
-                            .iter()
-                            .any(|s| {
-                                s.type_ == Some(MediaStreamType::Audio)
-                                    && s.language
-                                        .as_deref()
-                                        .map_or(false, |l| {
-                                            let l = normalize_lang_code(l);
-                                            !matches!(
-                                                l.as_str(),
-                                                "und" | "mis" | "zxx" | "mul"
-                                            ) && wanted.contains(&l)
-                                        })
-                            });
-                        bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
-                    }
-                },
-                // Unknown size (None) passes through, consistent with Size's
-                // original semantics and the AudioLanguage behavior above.
+                // Evidence precedence: concrete probed audio tracks →
+                // filename (hunch languages + release tags) → title original
+                // language. No evidence at any tier counts as "not a desired
+                // language": In/Is fails and NotIn/IsNot matches, so
+                // complementary In/NotIn groups over the same codes partition
+                // sources deterministically.
+                StreamRule::AudioLanguage { op, values } => {
+                    let evidence =
+                        language_evidence(probe_data, &parsed, raw, original_language);
+                    let wanted: Vec<String> = values
+                        .iter()
+                        .filter_map(|v| evidence_lang_code(v))
+                        .collect();
+                    let hit = evidence
+                        .iter()
+                        .any(|l| wanted.contains(l));
+                    bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
+                }
+                // Unknown size (None) passes through so HTTP/debrid/IPTV
+                // sources are not silently dropped.
                 StreamRule::Size { op, value } => match info.size {
                     None => MatchOutcome::PassThrough,
                     Some(s) => bool_to_outcome(match op {
@@ -522,10 +510,12 @@ impl StreamGroup {
                 s.stream_info
                     .as_ref()
                     .map_or(false, |info| {
-                        group.match_outcome(
+                        group.match_outcome_ctx(
                             info,
                             s.probe_data
                                 .as_ref(),
+                            s.original_language
+                                .as_deref(),
                         ) == MatchOutcome::Match
                     })
             })
@@ -535,11 +525,37 @@ impl StreamGroup {
             s.idx
                 .unwrap_or(0)
         });
+        rank_by_quality(&mut v);
         v
     }
 
+    /// Loads the raw stream rows for `parent_id`, falling back to the parent
+    /// itself when it carries its own stream (locally-imported files).
+    async fn raw_streams(db: &SqlitePool, parent_id: &Uuid) -> Result<Vec<Media>> {
+        let mut parent = Media::get_by_id(db, parent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("parent item not found"))?;
+        let raw = parent
+            .streams(db)
+            .await?;
+        if !raw.is_empty() {
+            return Ok(raw);
+        }
+        // The parent doubles as its own source; give it the same effective
+        // language its stream rows would inherit from `Media::streams`.
+        if parent
+            .original_language
+            .is_none()
+        {
+            parent.original_language = parent
+                .effective_original_language(db)
+                .await;
+        }
+        Ok(vec![parent])
+    }
+
     /// Returns all raw sources matching this group for the given parent item,
-    /// sorted by idx. Used by PlaybackInfo for group-scoped probe fallback.
+    /// quality-ranked. Used by PlaybackInfo for group-scoped probe fallback.
     pub async fn streams_for(
         db: &SqlitePool,
         group_id: &Uuid,
@@ -548,13 +564,7 @@ impl StreamGroup {
         let group = Self::get_by_id(db, group_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("stream group not found"))?;
-        let mut parent = Media::get_by_id(db, parent_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("parent item not found"))?;
-        let raw = parent
-            .streams(db)
-            .await?;
-        let raw = if raw.is_empty() { vec![parent] } else { raw };
+        let raw = Self::raw_streams(db, parent_id).await?;
         Ok(Self::candidates_for_group(&group, &raw))
     }
 
@@ -567,13 +577,7 @@ impl StreamGroup {
         parent_id: &Uuid,
     ) -> Result<Vec<Media>> {
         let groups = Self::list(db).await?;
-        let mut parent = Media::get_by_id(db, parent_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("parent item not found"))?;
-        let raw = parent
-            .streams(db)
-            .await?;
-        let raw = if raw.is_empty() { vec![parent] } else { raw };
+        let raw = Self::raw_streams(db, parent_id).await?;
 
         let mut result = vec![];
         let mut found = false;
@@ -591,6 +595,218 @@ impl StreamGroup {
         }
         Ok(result)
     }
+}
+
+/// Parses the best hunch candidate from a (possibly multi-line) stream name:
+/// torrent titles often carry a display line plus a filename line; the line
+/// yielding the most parsed facts wins. `None` when there are no non-empty
+/// lines.
+fn best_parse(raw: &str) -> Option<hunch::HunchResult> {
+    raw.lines()
+        .filter(|line| {
+            !line
+                .trim()
+                .is_empty()
+        })
+        .map(hunch::hunch)
+        .max_by_key(|parsed| {
+            (parsed
+                .screen_size()
+                .is_some() as u8)
+                + (parsed
+                    .source()
+                    .is_some() as u8)
+        })
+}
+
+/// Source quality of a parsed stream name, with substring fallback when
+/// hunch fails to identify the source.
+fn source_of(parsed: &hunch::HunchResult, raw: &str) -> StreamQuality {
+    let s = canonical_source(parsed);
+    if s == StreamQuality::Other {
+        fallback_source(raw)
+    } else {
+        s
+    }
+}
+
+/// Audio-language evidence for one source, by precedence: concrete probed
+/// audio-track languages override filename evidence (hunch languages plus
+/// release tags), which overrides the title's effective original language.
+/// Codes are normalized via [`evidence_lang_code`]; empty = no evidence at
+/// any tier.
+fn language_evidence(
+    probe_data: Option<&crate::api::MediaSourceInfo>,
+    parsed: &hunch::HunchResult,
+    raw: &str,
+    original_language: Option<&str>,
+) -> Vec<String> {
+    let probed: Vec<String> = probe_data
+        .into_iter()
+        .flat_map(|pd| {
+            pd.media_streams
+                .iter()
+        })
+        .filter(|s| s.type_ == Some(MediaStreamType::Audio))
+        .filter_map(|s| {
+            s.language
+                .as_deref()
+        })
+        .filter_map(evidence_lang_code)
+        .collect();
+    if !probed.is_empty() {
+        return probed;
+    }
+
+    let mut filename: Vec<String> = parsed
+        .languages()
+        .iter()
+        .filter_map(|l| evidence_lang_code(l))
+        .collect();
+    if let Some(castellano) = spanish_release_tag(raw) {
+        if castellano {
+            // hunch 2.0.1 maps Castellano to Catalan; the release term means
+            // Castilian Spanish.
+            filename.retain(|language| language != "cat");
+        }
+        if !filename
+            .iter()
+            .any(|language| language == "spa")
+        {
+            filename.push("spa".to_string());
+        }
+    }
+    if !filename.is_empty() {
+        return filename;
+    }
+
+    original_language
+        .and_then(evidence_lang_code)
+        .into_iter()
+        .collect()
+}
+
+/// Normalizes BCP 47, ISO 639, and hunch display names to the ISO 639-2
+/// codes used by `StreamRule::AudioLanguage`. Special no-content codes are
+/// not language evidence; unknown values remain concrete but cannot match a
+/// known code.
+fn evidence_lang_code(raw: &str) -> Option<String> {
+    let lower = raw
+        .trim()
+        .to_ascii_lowercase();
+    let primary = lower
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("");
+    if primary.is_empty() || matches!(primary, "und" | "mis" | "zxx" | "mul") {
+        return None;
+    }
+    if let Some((code, _)) = common_audio_languages()
+        .iter()
+        .find(|(code, name)| {
+            code.eq_ignore_ascii_case(primary) || name.eq_ignore_ascii_case(primary)
+        })
+    {
+        return Some((*code).to_string());
+    }
+    let language = isolang::Language::from_639_1(primary)
+        .or_else(|| isolang::Language::from_639_3(primary))
+        .or_else(|| {
+            isolang::languages().find(|language| {
+                language
+                    .to_name()
+                    .eq_ignore_ascii_case(primary)
+            })
+        });
+    Some(
+        language
+            .map(|language| normalize_lang_code(language.to_639_3()))
+            .unwrap_or_else(|| normalize_lang_code(primary)),
+    )
+}
+
+/// Separator-bounded Spanish release tags not handled correctly by hunch.
+/// A neighboring subtitle marker suppresses the inference: `Sub.Lat` says
+/// nothing about the audio track. The return value identifies Castellano so
+/// its incorrect hunch Catalan classification can be removed.
+fn spanish_release_tag(raw: &str) -> Option<bool> {
+    let is_subtitle = |token: &str| {
+        token.eq_ignore_ascii_case("sub")
+            || token.eq_ignore_ascii_case("subs")
+            || token.eq_ignore_ascii_case("subtitle")
+            || token.eq_ignore_ascii_case("subtitles")
+    };
+    let mut tokens = raw
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .peekable();
+    let mut previous = None;
+    while let Some(token) = tokens.next() {
+        let castellano = token.eq_ignore_ascii_case("castellano");
+        let is_spanish = castellano
+            || token.eq_ignore_ascii_case("lat")
+            || token.eq_ignore_ascii_case("latam");
+        let subtitle_context = previous.is_some_and(is_subtitle)
+            || tokens
+                .peek()
+                .is_some_and(|next| is_subtitle(next));
+        if is_spanish && !subtitle_context {
+            return Some(castellano);
+        }
+        previous = Some(token);
+    }
+    None
+}
+
+/// Ranks group candidates in place by resolution, then source quality:
+/// 2160p > 1080p > 720p > 480p > 360p > Unknown; within a resolution,
+/// Blu-ray Remux > Blu-ray > WEB-DL > WEBRip > HDTV > DVD > TV > Unknown.
+/// The sort is stable, so equal candidates keep incoming (raw/idx) order.
+/// Shared by `filter_sources`, group failover, and preview.
+pub(crate) fn rank_by_quality<M: std::borrow::Borrow<Media>>(candidates: &mut [M]) {
+    candidates.sort_by_cached_key(|media| {
+        M::borrow(media)
+            .stream_info
+            .as_ref()
+            .map_or((5, 7), candidate_rank)
+    });
+}
+
+fn candidate_rank(info: &StreamInfo) -> (u8, u8) {
+    let Some(raw) = info
+        .filename
+        .as_deref()
+        .or(info
+            .name
+            .as_deref())
+    else {
+        return (5, 7);
+    };
+    let Some(parsed) = best_parse(raw) else {
+        return (5, 7);
+    };
+    let resolution = min_screen_size(&parsed)
+        .and_then(StreamResolution::from_hunch)
+        .unwrap_or(StreamResolution::Other);
+    let resolution_rank = match resolution {
+        StreamResolution::R2160p => 0,
+        StreamResolution::R1080p => 1,
+        StreamResolution::R720p => 2,
+        StreamResolution::R480p => 3,
+        StreamResolution::R360p => 4,
+        StreamResolution::Other => 5,
+    };
+    let quality_rank = match source_of(&parsed, raw) {
+        StreamQuality::BluRayRemux => 0,
+        StreamQuality::BluRay => 1,
+        StreamQuality::WebDl => 2,
+        StreamQuality::WebRip => 3,
+        StreamQuality::Hdtv => 4,
+        StreamQuality::Dvd => 5,
+        StreamQuality::Tv => 6,
+        StreamQuality::Other => 7,
+    };
+    (resolution_rank, quality_rank)
 }
 
 /// Picks the lowest of hunch's screen-size candidates.
@@ -842,17 +1058,6 @@ mod tests {
         );
     }
 
-    // An unprobed source passes through (not absorbed by the group, but stays
-    // visible via ungrouped). This matches the Size rule's None behavior.
-    #[test]
-    fn audio_lang_unprobed_is_passthrough() {
-        let group = group_audio_lang(SetOp::Is, &["rus"]);
-        assert_eq!(
-            group.match_outcome(&info("a.mkv"), None),
-            MatchOutcome::PassThrough
-        );
-    }
-
     #[test]
     fn audio_lang_case_insensitive_and_any_track() {
         let group = group_audio_lang(SetOp::In, &["rus"]);
@@ -882,7 +1087,34 @@ mod tests {
         );
     }
 
-    // Special "no-linguistic-content" codes are treated as no language.
+    // With no probe, no filename language, and no title language there is no
+    // evidence at any tier: desired-language membership is false, so In/Is
+    // fails and NotIn/IsNot matches. Complementary In/NotIn groups over the
+    // same codes therefore partition every source deterministically —
+    // fallback groups catch what desired-language groups reject.
+    #[test]
+    fn audio_lang_no_evidence_fails_in_and_matches_not_in() {
+        let f = info("Movie.2024.1080p.WEB-DL.mkv");
+        assert_eq!(
+            group_audio_lang(SetOp::In, &["eng", "spa"]).match_outcome(&f, None),
+            MatchOutcome::NoMatch
+        );
+        assert_eq!(
+            group_audio_lang(SetOp::Is, &["eng"]).match_outcome(&f, None),
+            MatchOutcome::NoMatch
+        );
+        assert_eq!(
+            group_audio_lang(SetOp::NotIn, &["eng", "spa"]).match_outcome(&f, None),
+            MatchOutcome::Match
+        );
+        assert_eq!(
+            group_audio_lang(SetOp::IsNot, &["eng"]).match_outcome(&f, None),
+            MatchOutcome::Match
+        );
+    }
+
+    // Special "no-linguistic-content" codes are not concrete evidence; the
+    // probe tier falls through to the lower tiers, which are empty here.
     #[test]
     fn audio_lang_ignores_special_codes() {
         let group = group_audio_lang(SetOp::Is, &["rus"]);
@@ -922,67 +1154,215 @@ mod tests {
         assert_eq!(group.match_outcome(&si, None), MatchOutcome::PassThrough);
     }
 
-    // Mixed filter (All): Resolution Match + AudioLanguage PassThrough → PassThrough.
-    // The source is not confidently Russian, so it must NOT be shown as the group
-    // representative, but it must also stay visible via ungrouped.
+    // ── Language evidence ───────────────────────────────────────────────
+
+    fn group_eng_spa() -> StreamGroup {
+        group_audio_lang(SetOp::In, &["eng", "spa"])
+    }
+
     #[test]
-    fn audio_lang_combined_with_resolution_passes_through_in_all_mode() {
-        let group = StreamGroup {
-            id: Uuid::nil(),
-            name: "1080p · rus".to_string(),
-            filter: StreamFilter {
-                match_mode: FilterMatchMode::All,
-                rules: vec![
-                    StreamRule::Resolution {
-                        op: SetOp::In,
-                        values: vec![StreamResolution::R1080p],
-                    },
-                    StreamRule::AudioLanguage {
-                        op: SetOp::Is,
-                        values: vec!["rus".to_string()],
-                    },
-                ],
-            },
-            priority: 0,
-            enabled: true,
-            hidden: false,
-            created_at: String::new(),
-        };
+    fn audio_lang_hunch_filename_languages_match() {
+        let group = group_eng_spa();
         assert_eq!(
-            group.match_outcome(&info("Movie.2024.1080p.BluRay.mkv"), None),
-            MatchOutcome::PassThrough
+            group.match_outcome(&info("Movie.2024.1080p.WEBRip.Spanish.mkv"), None),
+            MatchOutcome::Match
+        );
+        assert_eq!(
+            group.match_outcome(&info("Movie.2024.1080p.English.WEB-DL.mkv"), None),
+            MatchOutcome::Match
+        );
+        // An explicit non-preferred filename language is concrete evidence,
+        // not an unknown: the source is confidently excluded.
+        assert_eq!(
+            group.match_outcome(&info("Movie.2024.1080p.Russian.WEB-DL.mkv"), None),
+            MatchOutcome::NoMatch
         );
     }
 
-    // Any mode: PassThrough is NOT a success. AudioLanguage PassThrough OR
-    // Quality NoMatch → NoMatch (no confident match on any rule).
+    // `-Lat` / `LATAM` are common LATAM-Spanish release tags hunch does not
+    // recognize; `Castellano` means Castilian Spanish even though hunch maps
+    // the token to Catalan. All are separator-bounded.
     #[test]
-    fn audio_lang_passthrough_is_not_a_success_in_any_mode() {
-        let group = StreamGroup {
-            id: Uuid::nil(),
-            name: "rus or bluray".to_string(),
-            filter: StreamFilter {
-                match_mode: FilterMatchMode::Any,
-                rules: vec![
-                    StreamRule::AudioLanguage {
-                        op: SetOp::Is,
-                        values: vec!["rus".to_string()],
-                    },
-                    StreamRule::Quality {
-                        op: SetOp::In,
-                        values: vec![StreamQuality::BluRay],
-                    },
-                ],
-            },
-            priority: 0,
-            enabled: true,
-            hidden: false,
-            created_at: String::new(),
-        };
-        // WEBRip → Quality NoMatch, AudioLanguage PassThrough (no probe) → NoMatch.
+    fn audio_lang_lat_release_tag_counts_as_spanish() {
+        let group = group_eng_spa();
         assert_eq!(
-            group.match_outcome(&info("Movie.2024.1080p.WEBRip.mkv"), None),
+            group.match_outcome(&info("Movie.2024.1080p.WEB-DL-Lat.mkv"), None),
+            MatchOutcome::Match
+        );
+        assert_eq!(
+            group.match_outcome(&info("Movie 2024 2160p LATAM WEB-DL.mkv"), None),
+            MatchOutcome::Match
+        );
+        assert_eq!(
+            group.match_outcome(&info("Movie.2024.1080p.Latino.WEB-DL.mkv"), None),
+            MatchOutcome::Match
+        );
+        assert_eq!(
+            group.match_outcome(&info("Movie.2024.1080p.Castellano.WEB-DL.mkv"), None),
+            MatchOutcome::Match
+        );
+        // Not separator-bounded → no evidence → not a desired language.
+        assert_eq!(
+            group.match_outcome(&info("Latitude.2024.1080p.WEB-DL.mkv"), None),
             MatchOutcome::NoMatch
+        );
+        // Subtitle tags do not provide audio-language evidence.
+        assert_eq!(
+            group.match_outcome(
+                &info("Movie.2024.1080p.Japanese.Sub.Lat.WEB-DL.mkv"),
+                None
+            ),
+            MatchOutcome::NoMatch
+        );
+        assert_eq!(
+            group_audio_lang(SetOp::In, &["cat"])
+                .match_outcome(&info("Movie.2024.1080p.Castellano.WEB-DL.mkv"), None),
+            MatchOutcome::NoMatch
+        );
+    }
+
+    // Probed track languages are ground truth and override filename tags.
+    #[test]
+    fn audio_lang_probe_overrides_filename_evidence() {
+        let group = group_eng_spa();
+        // Filename claims Russian, probe proves an English track.
+        assert_eq!(
+            group.match_outcome(
+                &info("Movie.2024.1080p.Russian.WEB-DL.mkv"),
+                Some(&probe_with_langs(&["eng"]))
+            ),
+            MatchOutcome::Match
+        );
+        // Filename claims Spanish, probe proves Russian-only audio.
+        assert_eq!(
+            group.match_outcome(
+                &info("Movie.2024.1080p.Latino.WEB-DL.mkv"),
+                Some(&probe_with_langs(&["rus"]))
+            ),
+            MatchOutcome::NoMatch
+        );
+        // A probe with only special codes is not concrete; filename decides.
+        assert_eq!(
+            group.match_outcome(
+                &info("Movie.2024.1080p.Latino.WEB-DL.mkv"),
+                Some(&probe_with_langs(&["und"]))
+            ),
+            MatchOutcome::Match
+        );
+    }
+
+    // Title-level original language (BCP 47, as stored on movies/series) is
+    // last-resort evidence when probe and filename say nothing.
+    #[test]
+    fn audio_lang_falls_back_to_original_language() {
+        let group = group_eng_spa();
+        assert_eq!(
+            group.match_outcome_ctx(
+                &info("Movie.2024.1080p.WEB-DL.mkv"),
+                None,
+                Some("en")
+            ),
+            MatchOutcome::Match
+        );
+        assert_eq!(
+            group.match_outcome_ctx(
+                &info("Movie.2024.1080p.WEB-DL.mkv"),
+                None,
+                Some("ru")
+            ),
+            MatchOutcome::NoMatch
+        );
+    }
+
+    #[test]
+    fn audio_lang_normalizes_chinese_code_variants() {
+        for value in ["chi", "zho", "zh-CN", "Chinese"] {
+            assert_eq!(evidence_lang_code(value).as_deref(), Some("chi"));
+        }
+    }
+
+    // Concrete filename evidence beats the title language: a Russian dub of
+    // an English-language movie must not enter an [eng, spa] group.
+    #[test]
+    fn audio_lang_filename_overrides_original_language() {
+        let group = group_eng_spa();
+        assert_eq!(
+            group.match_outcome_ctx(
+                &info("Movie.2024.1080p.Russian.WEB-DL.mkv"),
+                None,
+                Some("en")
+            ),
+            MatchOutcome::NoMatch
+        );
+    }
+
+    // ── Representative quality ranking ──────────────────────────────────
+
+    fn source(filename: &str) -> Media {
+        Media {
+            stream_info: Some(info(filename)),
+            ..Default::default()
+        }
+    }
+
+    // Candidates rank by the quality ladder; the stable sort keeps input
+    // (raw/idx) order for ties.
+    #[test]
+    fn rank_by_quality_orders_candidates_by_ladder() {
+        let mut candidates = vec![
+            source("Movie.2024.1080p.HDTV.x264.mkv"),
+            source("Movie.2024.1080p.WEB-DL.mkv"),
+            source("Movie.2024.1080p.BluRay.REMUX.AVC.mkv"),
+            source("Movie.2024.1080p.WEBRip.x264.mkv"),
+            source("Movie.2024.1080p.WEB-DL.DDP5.1.mkv"),
+        ];
+        rank_by_quality(&mut candidates);
+        let order: Vec<&str> = candidates
+            .iter()
+            .filter_map(|s| {
+                s.stream_info
+                    .as_ref()?
+                    .filename
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "Movie.2024.1080p.BluRay.REMUX.AVC.mkv",
+                "Movie.2024.1080p.WEB-DL.mkv",
+                "Movie.2024.1080p.WEB-DL.DDP5.1.mkv",
+                "Movie.2024.1080p.WEBRip.x264.mkv",
+                "Movie.2024.1080p.HDTV.x264.mkv",
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_by_quality_prefers_resolution_before_source() {
+        let mut candidates = vec![
+            source("Movie.2024.360p.BluRay.REMUX.mkv"),
+            source("Movie.2024.BluRay.REMUX.mkv"),
+            source("Movie.2024.480p.WEB-DL.mkv"),
+        ];
+        rank_by_quality(&mut candidates);
+        let order: Vec<&str> = candidates
+            .iter()
+            .filter_map(|source| {
+                source
+                    .stream_info
+                    .as_ref()?
+                    .filename
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "Movie.2024.480p.WEB-DL.mkv",
+                "Movie.2024.360p.BluRay.REMUX.mkv",
+                "Movie.2024.BluRay.REMUX.mkv",
+            ]
         );
     }
 

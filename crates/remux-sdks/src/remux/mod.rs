@@ -6306,6 +6306,7 @@ pub fn normalize_lang_code(code: &str) -> String {
         .to_ascii_lowercase()
         .as_str()
     {
+        "zho" => "chi".to_string(),
         "fra" => "fre".to_string(),
         "deu" => "ger".to_string(),
         other => other.to_string(),
@@ -6362,9 +6363,13 @@ pub enum StreamRule {
         op: NumericOp,
         value: i64,
     },
-    /// Audio track language (ISO 639-2/B code, e.g. "rus", "eng"). Matches if any
-    /// audio stream in `probe_data` has a listed language. A stream with no probe
-    /// data passes the rule so unprobed sources are not silently dropped.
+    /// Audio track language (ISO 639-2/B code, e.g. "rus", "eng"). Evidence is
+    /// gathered by precedence: probed audio-track languages (ignoring the
+    /// special und/mis/zxx/mul codes), then filename languages/release tags,
+    /// then the title's original language. A stream with no evidence at any
+    /// tier counts as not having a desired language: `In`/`Is` fails and
+    /// `NotIn`/`IsNot` matches, so complementary In/NotIn rules over the same
+    /// codes assign every source to exactly one group.
     AudioLanguage {
         op: SetOp,
         values: Vec<String>,
@@ -6759,6 +6764,7 @@ mod tests {
         assert_eq!(language_label("ENG"), "English");
         assert_eq!(language_label("fra"), "French");
         assert_eq!(language_label("deu"), "German");
+        assert_eq!(language_label("zho"), "Chinese");
         assert_eq!(language_label("xxx"), "xxx");
     }
 
@@ -6766,6 +6772,7 @@ mod tests {
     fn normalize_lang_code_maps_terminologic_to_bibliographic() {
         assert_eq!(normalize_lang_code("fra"), "fre");
         assert_eq!(normalize_lang_code("DEU"), "ger");
+        assert_eq!(normalize_lang_code("zho"), "chi");
         assert_eq!(normalize_lang_code("rus"), "rus");
     }
 

@@ -128,6 +128,18 @@ impl StreamService {
                 .stream_info
                 .is_some()
             {
+                if root
+                    .original_language
+                    .is_none()
+                {
+                    root.original_language = root
+                        .effective_original_language(
+                            &self
+                                .ctx
+                                .db,
+                        )
+                        .await;
+                }
                 vec![root]
             } else {
                 vec![]

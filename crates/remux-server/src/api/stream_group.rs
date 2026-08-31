@@ -14,6 +14,7 @@ use crate::{
     AppState,
     db::{
         ExternalIds, MatchOutcome, Media, MediaKind, NonEmptyString, StreamGroup, auth,
+        stream_group::rank_by_quality,
     },
 };
 use axum_anyhow::ApiResult as Result;
@@ -174,6 +175,18 @@ pub async fn stream_group_preview(
     session: auth::AuthSession,
     Query(q): Query<PreviewQuery>,
 ) -> Result<impl IntoResponse> {
+    // Preview streams come straight from the addons, so they lack the
+    // original-language enrichment persisted streams get from
+    // `Media::streams`. Resolve the catalog title by IMDb id and attach its
+    // language before matching.
+    let original_language = Media::original_language_by_imdb(
+        &state
+            .ctx
+            .db,
+        &q.imdb_id,
+    )
+    .await;
+
     let stub = Media {
         kind: MediaKind::Movie,
         external_ids: ExternalIds {
@@ -183,7 +196,7 @@ pub async fn stream_group_preview(
         ..Default::default()
     };
 
-    let raw_streams = state
+    let mut raw_streams = state
         .ctx
         .addons
         .get_streams(
@@ -196,6 +209,16 @@ pub async fn stream_group_preview(
             ),
         )
         .await?;
+
+    if let Some(lang) = &original_language {
+        for s in &mut raw_streams {
+            if s.original_language
+                .is_none()
+            {
+                s.original_language = Some(lang.clone());
+            }
+        }
+    }
 
     let groups = StreamGroup::list(
         &state
@@ -211,17 +234,36 @@ pub async fn stream_group_preview(
     let mut result_groups: Vec<PreviewGroupEntry> = vec![];
     let mut matched_ids: HashSet<Uuid> = HashSet::new();
 
+    fn stream_name(s: &Media) -> String {
+        s.stream_info
+            .as_ref()
+            .and_then(|i| {
+                i.filename
+                    .clone()
+                    .or_else(|| {
+                        i.name
+                            .clone()
+                    })
+            })
+            .unwrap_or_else(|| {
+                s.title
+                    .clone()
+            })
+    }
+
     for group in &enabled {
-        let matching: Vec<&Media> = raw_streams
+        let mut matching: Vec<&Media> = raw_streams
             .iter()
             .filter(|s| {
                 s.stream_info
                     .as_ref()
                     .map_or(false, |info| {
-                        group.match_outcome(
+                        group.match_outcome_ctx(
                             info,
                             s.probe_data
                                 .as_ref(),
+                            s.original_language
+                                .as_deref(),
                         ) == MatchOutcome::Match
                     })
             })
@@ -235,52 +277,24 @@ pub async fn stream_group_preview(
             matched_ids.insert(s.id);
         }
 
-        let stream_names: Vec<String> = matching
-            .iter()
-            .map(|s| {
-                s.stream_info
-                    .as_ref()
-                    .and_then(|i| {
-                        i.filename
-                            .clone()
-                            .or_else(|| {
-                                i.name
-                                    .clone()
-                            })
-                    })
-                    .unwrap_or_else(|| {
-                        s.title
-                            .clone()
-                    })
-            })
-            .collect();
+        // Same ranking as filter_sources: the first listed stream is the
+        // representative the group would surface.
+        rank_by_quality(&mut matching);
 
         result_groups.push(PreviewGroupEntry {
             name: group.display_name(),
             hidden: group.hidden,
-            streams: stream_names,
+            streams: matching
+                .iter()
+                .map(|s| stream_name(s))
+                .collect(),
         });
     }
 
     let ungrouped: Vec<String> = raw_streams
         .iter()
         .filter(|s| !matched_ids.contains(&s.id))
-        .map(|s| {
-            s.stream_info
-                .as_ref()
-                .and_then(|i| {
-                    i.filename
-                        .clone()
-                        .or_else(|| {
-                            i.name
-                                .clone()
-                        })
-                })
-                .unwrap_or_else(|| {
-                    s.title
-                        .clone()
-                })
-        })
+        .map(stream_name)
         .collect();
 
     Ok(Json(PreviewResponse {
