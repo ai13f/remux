@@ -279,6 +279,13 @@ async fn items_playbackinfo_inner(
         .probe_candidates()
         .await?;
     let specific_stream_requested = probed.specific_requested;
+    let first_effective_stream_id = probed
+        .results
+        .first()
+        .map(|r| {
+            r.effective_stream
+                .id
+        });
     let mut media_sources = Vec::with_capacity(
         probed
             .results
@@ -570,13 +577,16 @@ async fn items_playbackinfo_inner(
         );
     }
 
-    // Cache the group-resolved stream UUID so the stream endpoint can find it
-    // without re-running filter_sources (which could pick a different candidate).
-    service.save_preference(
-        &session
-            .device
-            .id,
-    );
+    // Cache the resolved stream UUID so the stream endpoint can find it
+    // without re-running selection (or probe fallback picking a different candidate).
+    if let Some(stream_id) = first_effective_stream_id {
+        service.save_preference(
+            &session
+                .device
+                .id,
+            stream_id,
+        );
+    }
 
     // When no specific stream was requested (initial load, or media_source_id == item_id),
     // override source[0].Id to equal the canonical item ID. Addon result IDs can

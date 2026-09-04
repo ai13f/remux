@@ -907,6 +907,7 @@ pub(crate) async fn probe_stream(
     max_retries: usize,
     probe_pool: &[db::Media],
     restrict_resolution: bool,
+    group_cascade: bool,
     port: u16,
     db: &sqlx::SqlitePool,
 ) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)> {
@@ -958,6 +959,7 @@ pub(crate) async fn probe_stream(
         max_retries,
         probe_pool,
         restrict_resolution,
+        group_cascade,
         port,
         db,
         |url| probe_media(&url),
@@ -971,6 +973,7 @@ fn select_candidates(
     auto_next_stream: bool,
     max_retries: usize,
     restrict_resolution: bool,
+    group_cascade: bool,
     port: u16,
 ) -> Vec<(db::Media, String)> {
     if !auto_next_stream {
@@ -1008,12 +1011,11 @@ fn select_candidates(
             }
             true
         })
-        // In group-cascade mode (restrict_resolution=false) try all candidates;
-        // otherwise honour the configured retry cap.
-        .take(if restrict_resolution {
-            max_retries
-        } else {
+        // In group-cascade mode try all candidates; otherwise honour the configured retry cap.
+        .take(if group_cascade {
             usize::MAX
+        } else {
+            max_retries
         })
         .filter_map(|c| {
             let url = c
@@ -1069,6 +1071,7 @@ async fn probe_with_fallback<F>(
     max_retries: usize,
     probe_pool: &[db::Media],
     restrict_resolution: bool,
+    group_cascade: bool,
     port: u16,
     db: &sqlx::SqlitePool,
     probe_fn: F,
@@ -1088,6 +1091,7 @@ where
         auto_next_stream,
         max_retries,
         restrict_resolution,
+        group_cascade,
         port,
     );
 
@@ -1333,6 +1337,7 @@ mod probe_tests {
             false,
             3,
             false,
+            false,
             3000,
         );
         assert!(result.is_empty());
@@ -1343,7 +1348,7 @@ mod probe_tests {
         let primary = http_media("http://a.example.com");
         let other = http_media("http://b.example.com");
         let all = vec![primary.clone(), other];
-        let result = select_candidates(&primary, &all, true, 10, false, 3000);
+        let result = select_candidates(&primary, &all, true, 10, false, false, 3000);
         assert!(
             result
                 .iter()
@@ -1356,7 +1361,7 @@ mod probe_tests {
         let primary = http_media("http://a.example.com");
         let p2p = p2p_media();
         let all = vec![primary.clone(), p2p];
-        let result = select_candidates(&primary, &all, true, 10, false, 3000);
+        let result = select_candidates(&primary, &all, true, 10, false, false, 3000);
         assert!(result.is_empty());
     }
 
@@ -1384,18 +1389,18 @@ mod probe_tests {
         let other =
             http_media_with_filename("http://b.example.com", "Movie.720p.BluRay.mkv");
         let all = vec![primary.clone(), other];
-        let result = select_candidates(&primary, &all, true, 10, true, 3000);
+        let result = select_candidates(&primary, &all, true, 10, true, false, 3000);
         assert!(result.is_empty());
     }
 
     #[test]
-    fn resolution_mismatch_allowed_in_cascade() {
+    fn resolution_mismatch_allowed_when_unrestricted() {
         let primary =
             http_media_with_filename("http://a.example.com", "Movie.1080p.BluRay.mkv");
         let other =
             http_media_with_filename("http://b.example.com", "Movie.720p.BluRay.mkv");
         let all = vec![primary.clone(), other];
-        let result = select_candidates(&primary, &all, true, 10, false, 3000);
+        let result = select_candidates(&primary, &all, true, 10, false, false, 3000);
         assert_eq!(result.len(), 1);
     }
 
@@ -1408,8 +1413,28 @@ mod probe_tests {
         let all: Vec<_> = std::iter::once(primary.clone())
             .chain(others)
             .collect();
-        let result = select_candidates(&primary, &all, true, 2, true, 3000);
+        let result = select_candidates(&primary, &all, true, 2, true, false, 3000);
         assert!(result.len() <= 2);
+    }
+
+    #[test]
+    fn ungrouped_cross_resolution_honors_retry_cap() {
+        let primary =
+            http_media_with_filename("http://a.example.com", "Movie.1080p.BluRay.mkv");
+        let others: Vec<_> = (0..5)
+            .map(|i| {
+                http_media_with_filename(
+                    &format!("http://s{i}.example.com"),
+                    "Movie.720p.BluRay.mkv",
+                )
+            })
+            .collect();
+        let all: Vec<_> = std::iter::once(primary.clone())
+            .chain(others)
+            .collect();
+        // restrict_resolution=false, group_cascade=false -> crosses resolution but honors max_retries
+        let result = select_candidates(&primary, &all, true, 2, false, false, 3000);
+        assert_eq!(result.len(), 2);
     }
 
     #[test]
@@ -1421,7 +1446,7 @@ mod probe_tests {
         let all: Vec<_> = std::iter::once(primary.clone())
             .chain(others)
             .collect();
-        let result = select_candidates(&primary, &all, true, 1, false, 3000);
+        let result = select_candidates(&primary, &all, true, 1, false, true, 3000);
         assert_eq!(result.len(), 5);
     }
 
@@ -1438,6 +1463,7 @@ mod probe_tests {
             false,
             0,
             &all,
+            false,
             false,
             3000,
             &db,
@@ -1466,6 +1492,7 @@ mod probe_tests {
             5,
             &all,
             false,
+            false,
             3000,
             &db,
             queued_probe(vec![Err(anyhow!("primary failed")), video_probe()]),
@@ -1491,6 +1518,7 @@ mod probe_tests {
             true,
             5,
             &all,
+            false,
             false,
             3000,
             &db,
@@ -1532,6 +1560,7 @@ mod probe_tests {
             5,
             &all,
             false,
+            false,
             3000,
             &db,
             queued_probe(vec![short_probe, video_probe()]),
@@ -1557,6 +1586,7 @@ mod probe_tests {
             0,
             &all,
             false,
+            false,
             3000,
             &db,
             queued_probe(vec![]),
@@ -1581,9 +1611,10 @@ mod probe_tests {
             Some("http://s0.example.com".to_string()),
             10,
             true,
-            1, // max_retries=1, but restrict_resolution=false → cascade
+            1, // max_retries=1, but group_cascade=true → cascade
             &sources,
             false,
+            true,
             3000,
             &db,
             queued_probe(vec![
@@ -1598,6 +1629,43 @@ mod probe_tests {
         assert!(
             err.contains("tried 4 of 4 streams"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ungrouped_cross_resolution_fallback_honors_retry_cap() {
+        let db = test_db().await;
+        let primary =
+            http_media_with_filename("http://s0.example.com", "Movie.1080p.mkv");
+        let others: Vec<_> = (1..4)
+            .map(|i| {
+                http_media_with_filename(
+                    &format!("http://s{i}.example.com"),
+                    "Movie.720p.mkv",
+                )
+            })
+            .collect();
+        let all: Vec<_> = std::iter::once(primary.clone())
+            .chain(others)
+            .collect();
+        let result = probe_with_fallback(
+            primary,
+            Some("http://s0.example.com".to_string()),
+            10,
+            true,
+            1, // max_retries=1; restrict_resolution=false, group_cascade=false
+            &all,
+            false,
+            false,
+            3000,
+            &db,
+            queued_probe(vec![Err(anyhow!("fail")), Err(anyhow!("fail"))]),
+        )
+        .await;
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("tried 2 of 2 streams"),
+            "expected retry cap to bound attempts (primary + 1 fallback = 2), got: {err}"
         );
     }
 
@@ -1621,6 +1689,7 @@ mod probe_tests {
             true,
             5,
             &probe_pool,
+            false,
             false,
             3000,
             &db,

@@ -8,6 +8,7 @@ use remux_sdks::{
     remux::{MediaStreamType, StreamFilter, VideoRangeType},
     remuxdb,
 };
+use std::collections::HashSet;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -431,6 +432,7 @@ impl StreamService {
                     .candidates()
                     .to_vec(),
                 restrict_resolution: false,
+                group_cascade: true,
                 probe_only_first: false,
                 specific_requested: true,
             };
@@ -463,7 +465,8 @@ impl StreamService {
         StreamSelection {
             candidates,
             probe_pool,
-            restrict_resolution: true,
+            restrict_resolution: specific_requested,
+            group_cascade: false,
             probe_only_first,
             specific_requested,
         }
@@ -521,6 +524,7 @@ impl StreamService {
             sel.candidates
                 .len(),
         );
+        let mut seen_effective = HashSet::new();
         for (idx, stream) in sel
             .candidates
             .into_iter()
@@ -557,6 +561,7 @@ impl StreamService {
                 max_retries,
                 &sel.probe_pool,
                 sel.restrict_resolution,
+                sel.group_cascade,
                 port,
                 &self
                     .ctx
@@ -564,6 +569,9 @@ impl StreamService {
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            if !seen_effective.insert(effective_stream.id) {
+                continue;
+            }
 
             // Use the StreamGroup UUID when this candidate is a group representative
             // (group_id is set by filter_sources). This ensures the client sends back
@@ -612,7 +620,7 @@ impl StreamService {
             // Re-apply binge-group headers — ffmpeg probing produces a fresh
             // MediaSourceInfo and would otherwise drop provider hints.
             source.remux = Some(api::MediaSourceRemuxInfo {
-                provider_info: stream
+                provider_info: effective_stream
                     .stream_info
                     .as_ref()
                     .and_then(|si| serde_json::to_value(si).ok()),
@@ -666,22 +674,17 @@ impl StreamService {
     }
 
     /// Persist the resolved stream UUID in the device-preference store (24 h TTL).
-    /// Also records the group→item association so /Items/{group_uuid} can redirect
-    /// to the correct content item without a DB scan.
-    /// No-op when this was not a group request.
-    pub fn save_preference(&self, device_key: &str) {
-        let Some((gid, _, _)) = &self.group else {
-            return;
-        };
+    /// When this was a group request, also records the group→item association so
+    /// /Items/{group_uuid} can redirect to the correct content item without a DB scan.
+    pub fn save_preference(&self, device_key: &str, effective_stream_id: Uuid) {
         self.ctx
             .store
             .save(
                 format!("pstream:{}:{}", self.item_id, device_key),
-                self.candidate()
-                    .id,
+                effective_stream_id,
                 std::time::Duration::from_secs(24 * 3600),
             );
-        if let Some(uid) = self.user_id {
+        if let (Some((gid, _, _)), Some(uid)) = (&self.group, self.user_id) {
             Self::save_group_item(
                 &self
                     .ctx
@@ -732,9 +735,10 @@ pub(crate) struct StreamSelection {
     pub candidates: Vec<db::Media>,
     /// Full pool used for probe-fallback across sibling streams.
     pub probe_pool: Vec<db::Media>,
-    /// When false (group requests), cross-resolution fallback is intentional.
+    /// When false (group requests and autoplay), cross-resolution fallback is intentional.
     pub restrict_resolution: bool,
-    /// Probe only the first candidate to avoid N parallel FFmpeg processes.
+    /// When true (group requests), try all candidates across the group.
+    pub group_cascade: bool,
     pub probe_only_first: bool,
     /// True when the client named a specific stream — keep its UUID, don't override to item_id.
     pub specific_requested: bool,
@@ -956,5 +960,82 @@ mod tests {
 
         assert_eq!(selected.id, preferred.id);
         assert_eq!(selected.group_id, Some(group.id));
+    }
+    #[tokio::test]
+    async fn select_streams_restrict_resolution_reflects_specificity() {
+        let (_server, guard) = new_test_server()
+            .await
+            .unwrap();
+        let s1 = source("Movie.2160p.WEB-DL.mkv");
+        let s2 = source("Movie.1080p.WEB-DL.mkv");
+        let item_id = Uuid::new_v4();
+
+        // Autoplay / no requested ID -> cross-resolution fallback allowed, honors retry cap
+        let mut service = StreamService::new(StreamServiceConfig {
+            ctx: guard
+                .0
+                .clone(),
+            item_id,
+            requested_id: None,
+            show_ungrouped: true,
+            stream_filter: None,
+            user_id: None,
+        });
+        service.streams = vec![s1.clone(), s2.clone()];
+        let sel = service.select_streams();
+        assert!(!sel.restrict_resolution);
+        assert!(!sel.group_cascade);
+        assert!(!sel.specific_requested);
+
+        // Android TV autoplay (media_source_id == item_id) -> cross-resolution, honors retry cap
+        service.requested_id = Some(item_id);
+        let sel_autoplay = service.select_streams();
+        assert!(!sel_autoplay.restrict_resolution);
+        assert!(!sel_autoplay.group_cascade);
+        assert!(!sel_autoplay.specific_requested);
+
+        // Explicit raw stream ID -> resolution restricted, honors retry cap
+        service.requested_id = Some(s2.id);
+        let sel_explicit = service.select_streams();
+        assert!(sel_explicit.restrict_resolution);
+        assert!(!sel_explicit.group_cascade);
+        assert!(sel_explicit.specific_requested);
+
+        // Group request -> cross-resolution allowed, cascades all candidates
+        service.group =
+            Some((Uuid::new_v4(), "Group".into(), vec![s1.clone(), s2.clone()]));
+        let sel_group = service.select_streams();
+        assert!(!sel_group.restrict_resolution);
+        assert!(sel_group.group_cascade);
+        assert!(sel_group.specific_requested);
+    }
+
+    #[tokio::test]
+    async fn save_preference_stores_effective_stream_without_group() {
+        let (_server, guard) = new_test_server()
+            .await
+            .unwrap();
+        let item_id = Uuid::new_v4();
+        let effective_id = Uuid::new_v4();
+        let device_key = "device-123";
+
+        let service = StreamService::new(StreamServiceConfig {
+            ctx: guard
+                .0
+                .clone(),
+            item_id,
+            requested_id: None,
+            show_ungrouped: true,
+            stream_filter: None,
+            user_id: None,
+        });
+
+        service.save_preference(device_key, effective_id);
+
+        let saved = guard
+            .0
+            .store
+            .get::<Uuid>(&format!("pstream:{}:{}", item_id, device_key));
+        assert_eq!(saved.as_deref(), Some(&effective_id));
     }
 }

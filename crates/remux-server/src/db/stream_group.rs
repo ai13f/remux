@@ -239,8 +239,7 @@ impl StreamGroup {
     /// Returns one representative source per matching group — the best
     /// candidate on the quality ladder (see [`rank_by_quality`]), ties broken
     /// by incoming order — plus any unmatched sources when `show_ungrouped`
-    /// is true.  When no groups are enabled the original list is returned
-    /// unchanged.
+    /// is true. When no groups are enabled the sources are ranked by quality.
     pub async fn filter_sources(
         db: &SqlitePool,
         sources: Vec<Media>,
@@ -255,7 +254,7 @@ impl StreamGroup {
 
     pub(crate) fn filter_sources_for_groups(
         groups: &[StreamGroup],
-        sources: Vec<Media>,
+        mut sources: Vec<Media>,
         show_ungrouped: bool,
     ) -> Vec<Media> {
         let mut result = Vec::new();
@@ -307,6 +306,7 @@ impl StreamGroup {
         }
 
         if !any_enabled {
+            rank_by_quality(&mut sources);
             return sources;
         }
         if show_ungrouped {
@@ -676,6 +676,13 @@ fn language_evidence(
             filename.push("spa".to_string());
         }
     }
+    if russian_release_tag(raw)
+        && !filename
+            .iter()
+            .any(|language| language == "rus")
+    {
+        filename.push("rus".to_string());
+    }
     if !filename.is_empty() {
         return filename;
     }
@@ -756,6 +763,12 @@ fn spanish_release_tag(raw: &str) -> Option<bool> {
         previous = Some(token);
     }
     None
+}
+/// Separator-bounded Russian release tags (e.g. release group ColdFilm)
+/// not classified as Russian by hunch.
+fn russian_release_tag(raw: &str) -> bool {
+    raw.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case("coldfilm"))
 }
 
 /// Ranks group candidates in place by resolution, then source quality:
@@ -1220,6 +1233,34 @@ mod tests {
             MatchOutcome::NoMatch
         );
     }
+    #[test]
+    fn audio_lang_coldfilm_counts_as_russian_unless_probe_overrides() {
+        let group = group_audio_lang(SetOp::NotIn, &["rus"]);
+        let coldfilm = info("Gutierrez.is.mai.neim.S01E04.1080p.ColdFilm.mkv");
+        // Absent probe: ColdFilm release group token is concrete Russian evidence -> rejected by NotIn rus
+        assert_eq!(group.match_outcome(&coldfilm, None), MatchOutcome::NoMatch);
+        // Unlabelled probe: falls back to filename evidence -> rejected
+        assert_eq!(
+            group.match_outcome(&coldfilm, Some(&probe_with_langs(&["und"]))),
+            MatchOutcome::NoMatch
+        );
+        // Probe proves Spanish audio -> probe takes precedence over filename -> accepted by NotIn rus
+        assert_eq!(
+            group.match_outcome(&coldfilm, Some(&probe_with_langs(&["spa"]))),
+            MatchOutcome::Match
+        );
+
+        // Subtitle token adjacent to ColdFilm does NOT suppress Russian release tag
+        let coldfilm_sub = info("Movie.ColdFilm.SUB.mkv");
+        assert_eq!(
+            group.match_outcome(&coldfilm_sub, None),
+            MatchOutcome::NoMatch
+        );
+        assert_eq!(
+            group.match_outcome(&coldfilm_sub, Some(&probe_with_langs(&["eng"]))),
+            MatchOutcome::Match
+        );
+    }
 
     // Probed track languages are ground truth and override filename tags.
     #[test]
@@ -1362,6 +1403,32 @@ mod tests {
                 "Movie.2024.480p.WEB-DL.mkv",
                 "Movie.2024.360p.BluRay.REMUX.mkv",
                 "Movie.2024.BluRay.REMUX.mkv",
+            ]
+        );
+    }
+    #[test]
+    fn filter_sources_without_enabled_groups_sorts_by_quality() {
+        let sources = vec![
+            source("Movie.2024.720p.WEB-DL.mkv"),
+            source("Movie.2024.2160p.WEB-DL.mkv"),
+            source("Movie.2024.1080p.WEB-DL.mkv"),
+        ];
+        let ordered = StreamGroup::filter_sources_for_groups(&[], sources, true);
+        let order: Vec<&str> = ordered
+            .iter()
+            .filter_map(|s| {
+                s.stream_info
+                    .as_ref()?
+                    .filename
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "Movie.2024.2160p.WEB-DL.mkv",
+                "Movie.2024.1080p.WEB-DL.mkv",
+                "Movie.2024.720p.WEB-DL.mkv",
             ]
         );
     }
