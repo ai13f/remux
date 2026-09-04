@@ -776,7 +776,7 @@ fn russian_release_tag(raw: &str) -> bool {
 /// > uncached ("[RD download]", "⏳"), which need a provider-side fetch and
 /// usually fail the probe. Then 2160p > 1080p > 720p > 480p > 360p > Unknown;
 /// within a resolution, Blu-ray Remux > Blu-ray > WEB-DL > WEBRip > HDTV >
-/// DVD > TV > Unknown.
+/// DVD > TV > Unknown. Ties go to Premiumize ("[PM …]") sources.
 /// The sort is stable, so equal candidates keep incoming (raw/idx) order.
 /// Shared by `filter_sources`, group failover, and preview.
 pub(crate) fn rank_by_quality<M: std::borrow::Borrow<Media>>(candidates: &mut [M]) {
@@ -784,21 +784,23 @@ pub(crate) fn rank_by_quality<M: std::borrow::Borrow<Media>>(candidates: &mut [M
         M::borrow(media)
             .stream_info
             .as_ref()
-            .map_or((1, 5, 7), candidate_rank)
+            .map_or((1, 5, 7, 1), candidate_rank)
     });
 }
 
-/// Debrid readiness from the addon label's first line (`StreamInfo::name` is
-/// "<name>\n<description>"): 0 cached, 1 unknown, 2 uncached.
-fn availability_rank(info: &StreamInfo) -> u8 {
-    let Some(label) = info
-        .name
+/// First line of the addon label (`StreamInfo::name` is "<name>\n<description>").
+fn label_line(info: &StreamInfo) -> Option<&str> {
+    info.name
         .as_deref()
         .and_then(|name| {
             name.lines()
                 .next()
         })
-    else {
+}
+
+/// Debrid readiness from the addon label: 0 cached, 1 unknown, 2 uncached.
+fn availability_rank(info: &StreamInfo) -> u8 {
+    let Some(label) = label_line(info) else {
         return 1;
     };
     let lower = label.to_ascii_lowercase();
@@ -811,8 +813,23 @@ fn availability_rank(info: &StreamInfo) -> u8 {
     }
 }
 
-fn candidate_rank(info: &StreamInfo) -> (u8, u8, u8) {
+/// Premiumize ("[PM …]") sources win ties: 0, everything else 1.
+fn provider_rank(info: &StreamInfo) -> u8 {
+    match label_line(info) {
+        Some(label)
+            if label
+                .trim_start()
+                .starts_with("[PM") =>
+        {
+            0
+        }
+        _ => 1,
+    }
+}
+
+fn candidate_rank(info: &StreamInfo) -> (u8, u8, u8, u8) {
     let availability = availability_rank(info);
+    let provider = provider_rank(info);
     let Some(raw) = info
         .filename
         .as_deref()
@@ -820,10 +837,10 @@ fn candidate_rank(info: &StreamInfo) -> (u8, u8, u8) {
             .name
             .as_deref())
     else {
-        return (availability, 5, 7);
+        return (availability, 5, 7, provider);
     };
     let Some(parsed) = best_parse(raw) else {
-        return (availability, 5, 7);
+        return (availability, 5, 7, provider);
     };
     let resolution = min_screen_size(&parsed)
         .and_then(StreamResolution::from_hunch)
@@ -846,7 +863,7 @@ fn candidate_rank(info: &StreamInfo) -> (u8, u8, u8) {
         StreamQuality::Tv => 6,
         StreamQuality::Other => 7,
     };
-    (availability, resolution_rank, quality_rank)
+    (availability, resolution_rank, quality_rank, provider)
 }
 
 /// Picks the lowest of hunch's screen-size candidates.
@@ -1476,6 +1493,60 @@ mod tests {
                 "Show.S01E04.720p.WEB-DL.mkv",
                 "Show.S01E04.1080p.WEB-DL.mkv",
                 "Show.S01E04.2160p.WEB-DL.mkv",
+            ]
+        );
+    }
+
+    // With availability, resolution and quality equal, Premiumize wins;
+    // it never outranks a better tier.
+    #[test]
+    fn rank_by_quality_breaks_ties_toward_premiumize() {
+        let labeled = |filename: &str, label: &str| {
+            let mut media = source(filename);
+            media
+                .stream_info
+                .as_mut()
+                .unwrap()
+                .name = Some(label.to_string());
+            media
+        };
+        let mut candidates = vec![
+            labeled(
+                "Show.S01E04.1080p.WEB-DL.rd.mkv",
+                "[RD ⚡] \nDebridio 1080p",
+            ),
+            labeled(
+                "Show.S01E04.1080p.WEB-DL.tb.mkv",
+                "[TB ⚡] \nLatinobrid 1080p",
+            ),
+            labeled(
+                "Show.S01E04.1080p.WEB-DL.pm.mkv",
+                "[PM ⚡] \nDebridio 1080p",
+            ),
+            labeled("Show.S01E04.720p.WEB-DL.pm.mkv", "[PM ⚡] \nDebridio 720p"),
+            labeled(
+                "Show.S01E04.2160p.WEB-DL.pm.mkv",
+                "[PM download] \nDebridio 4k",
+            ),
+        ];
+        rank_by_quality(&mut candidates);
+        let order: Vec<&str> = candidates
+            .iter()
+            .filter_map(|s| {
+                s.stream_info
+                    .as_ref()?
+                    .filename
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "Show.S01E04.1080p.WEB-DL.pm.mkv",
+                "Show.S01E04.1080p.WEB-DL.rd.mkv",
+                "Show.S01E04.1080p.WEB-DL.tb.mkv",
+                "Show.S01E04.720p.WEB-DL.pm.mkv",
+                "Show.S01E04.2160p.WEB-DL.pm.mkv",
             ]
         );
     }
