@@ -22,7 +22,7 @@ impl AddonPreset for IntroDbPreset {
             id: "introdb".to_string(),
             display_name: "IntroDb".to_string(),
             description:
-                "Fetches intro/credits timestamps from the community IntroDb database."
+                "Fetches intro/recap/outro timestamps from the community IntroDb database."
                     .to_string(),
             icon: None,
             supported_resources: vec![AddonMetadata::simple_resource(
