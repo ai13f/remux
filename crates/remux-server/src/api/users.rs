@@ -307,7 +307,7 @@ pub async fn users_authenticatebyname(
     )
     .await?
     .context_unauthorized("not found")?;
-    let device = auth::Device::new_from_header(auth_header, &user)?;
+    let mut device = auth::Device::new_from_header(auth_header, &user)?;
     device
         .save(
             &state
@@ -356,7 +356,7 @@ pub async fn authenticate_with_quickconnect(
     .await?
     .context_unauthorized("User not found")?;
 
-    let device = auth::Device {
+    let mut device = auth::Device {
         id: auth_header
             .device_id
             .unwrap_or_else(|| get_uuid().to_string()),
@@ -2291,11 +2291,8 @@ mod e2e_tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_valid_credentials() {
-        let (server, _ctx) = new_test_server()
-            .await
-            .unwrap();
-
+    async fn repeated_login_keeps_first_token_valid_until_logout() {
+        let (server, guard, first_token) = authenticated_server().await;
         let resp = server
             .post("/users/authenticatebyname")
             .add_header(
@@ -2307,12 +2304,119 @@ mod e2e_tests {
 
         resp.assert_status_ok();
         let body: serde_json::Value = resp.json();
-        assert!(
-            body["AccessToken"]
-                .as_str()
-                .is_some_and(|t| !t.is_empty())
-        );
+        assert!(body["AccessToken"].as_str() == Some(first_token.as_str()));
         assert_eq!(body["User"]["Name"], "test");
+
+        // Token-only auth must still work, and must still record activity.
+        server
+            .get("/users/me")
+            .add_header("X-Emby-Token", HeaderValue::from_str(&first_token).unwrap())
+            .await
+            .assert_status_ok();
+        let device = auth::Device::get_by_access_token(
+            &guard
+                .0
+                .db,
+            &first_token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            device
+                .last_activity_at
+                .is_some()
+        );
+
+        server
+            .post("/sessions/logout")
+            .add_header("X-Emby-Token", HeaderValue::from_str(&first_token).unwrap())
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        server
+            .get("/users/me")
+            .add_header("X-Emby-Token", HeaderValue::from_str(&first_token).unwrap())
+            .expect_failure()
+            .await
+            .assert_status_unauthorized();
+
+        let resp = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "test", "Pw": "test" }))
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let new_token = body["AccessToken"]
+            .as_str()
+            .unwrap();
+        assert!(new_token != first_token);
+        server
+            .get("/users/me")
+            .add_header("X-Emby-Token", HeaderValue::from_str(new_token).unwrap())
+            .await
+            .assert_status_ok();
+        server
+            .get("/users/me")
+            .add_header("X-Emby-Token", HeaderValue::from_str(&first_token).unwrap())
+            .expect_failure()
+            .await
+            .assert_status_unauthorized();
+    }
+
+    #[tokio::test]
+    async fn login_without_parseable_device_header_creates_fresh_devices() {
+        let (server, guard) = new_test_server()
+            .await
+            .unwrap();
+        let mut tokens = std::collections::HashSet::new();
+        let mut device_ids = std::collections::HashSet::new();
+        for header in [None, Some("not-a-mediabrowser-header")] {
+            for _ in 0..2 {
+                let mut request = server
+                    .post("/users/authenticatebyname")
+                    .json(&json!({ "Username": "test", "Pw": "test" }));
+                if let Some(header) = header {
+                    request = request.add_header(
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_static(header),
+                    );
+                }
+                let response = request.await;
+                response.assert_status_ok();
+                let body: serde_json::Value = response.json();
+                let token = body["AccessToken"]
+                    .as_str()
+                    .unwrap();
+                let device = auth::Device::get_by_access_token(
+                    &guard
+                        .0
+                        .db,
+                    token,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(device.name, "Unknown Device");
+                assert!(tokens.insert(token.to_string()));
+                assert!(device_ids.insert(device.id));
+            }
+        }
+        assert_eq!(
+            auth::Device::get_all(
+                &guard
+                    .0
+                    .db,
+                None
+            )
+            .await
+            .unwrap()
+            .len(),
+            4
+        );
     }
 
     #[tokio::test]
