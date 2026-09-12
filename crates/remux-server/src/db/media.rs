@@ -4424,12 +4424,24 @@ impl Media {
             }
             if let Some(related_kinds) = &filter.genre_related_kinds {
                 if !related_kinds.is_empty() {
-                    qb.push(
-                        " AND id IN (\
-                            SELECT DISTINCT mr.right_media_id FROM media_relations mr \
-                            JOIN media item ON item.id = mr.left_media_id \
-                            WHERE item.kind IN (",
-                    );
+                    if is_smart_collection && is_genre_scope_query {
+                        // Probe each genre's relations instead of materialising
+                        // every matching series/episode relation first.
+                        qb.push(
+                            " AND EXISTS (\
+                                SELECT 1 FROM media_relations mr \
+                                JOIN media item ON item.id = mr.left_media_id \
+                                WHERE mr.right_media_id = media.id \
+                                AND item.kind IN (",
+                        );
+                    } else {
+                        qb.push(
+                            " AND id IN (\
+                                SELECT DISTINCT mr.right_media_id FROM media_relations mr \
+                                JOIN media item ON item.id = mr.left_media_id \
+                                WHERE item.kind IN (",
+                        );
+                    }
                     let mut sep = qb.separated(", ");
                     for k in related_kinds {
                         sep.push_bind(k);
@@ -4437,9 +4449,17 @@ impl Media {
                     qb.push(")");
                     if is_genre_scope_query {
                         if let Some(ref rules) = filter.filter_rules {
-                            qb.push(
-                                " AND item.id IN (SELECT media.id FROM media WHERE 1 = 1",
-                            );
+                            if is_smart_collection {
+                                // Keep `media` bound to the scope item for the
+                                // generated rules, including an empty rule group.
+                                qb.push(
+                                    " AND EXISTS (SELECT 1 FROM media WHERE media.id = item.id",
+                                );
+                            } else {
+                                qb.push(
+                                    " AND item.id IN (SELECT media.id FROM media WHERE 1 = 1",
+                                );
+                            }
                             apply_filter_rules(
                                 qb,
                                 rules,
@@ -9436,6 +9456,146 @@ mod tests {
     fn provider_rating_ignores_an_unrated_item() {
         assert_eq!(tmdb_ratings(0.0, Some(0)).provider_rating(), None);
         assert_eq!(ExternalRatings::default().provider_rating(), None);
+    }
+
+    mod smart_collection_genres {
+        use super::*;
+        use remux_sdks::remux::{
+            CollectionFilter, FilterGroup, FilterMatchMode, FilterRule, SetOp,
+        };
+
+        async fn fixture() -> (SqlitePool, MediaFilter) {
+            let db = crate::db::connect("sqlite::memory:", 10_000)
+                .await
+                .unwrap();
+            crate::db::migrate(&db)
+                .await
+                .unwrap();
+            let rules = CollectionFilter {
+                match_mode: FilterMatchMode::All,
+                groups: vec![FilterGroup {
+                    match_mode: FilterMatchMode::All,
+                    rules: vec![],
+                }],
+            };
+            let parent = Media {
+                id: Uuid::from_u128(100),
+                title: "Series".into(),
+                kind: MediaKind::Collection,
+                collection_kind: Some(CollectionKind::Smart),
+                collection_media_kind: Some(CollectionMediaKind::Series),
+                collection_smart_filter: Some(rules.clone()),
+                ..Default::default()
+            };
+            let mut media = vec![parent.clone()];
+            for (id, title, kind, parent_idx, idx) in [
+                (1, "Matching series", MediaKind::Series, None, None),
+                (2, "Other series", MediaKind::Series, None, None),
+                (3, "Movie", MediaKind::Movie, None, None),
+                (4, "apple", MediaKind::Genre, None, None),
+                (5, "Zebra", MediaKind::Genre, None, None),
+                (6, "Indexed", MediaKind::MusicGenre, None, Some(1)),
+                (7, "Parent indexed", MediaKind::Genre, Some(1), None),
+                (8, "Movie only", MediaKind::Genre, None, None),
+            ] {
+                media.push(Media {
+                    id: Uuid::from_u128(id),
+                    title: title.into(),
+                    kind,
+                    parent_idx,
+                    idx,
+                    external_ids: ExternalIds {
+                        tmdb: (id <= 3).then_some(id as i64),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            }
+            Media::insert(&db, &media)
+                .await
+                .unwrap();
+            let relations: Vec<_> = [(1, 4), (1, 5), (2, 4), (2, 6), (2, 7), (3, 8)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (left, right))| MediaRelation {
+                    relation_id: Uuid::from_u128(i as u128 + 200),
+                    left_media_id: Uuid::from_u128(left),
+                    right_media_id: Uuid::from_u128(right),
+                    ..Default::default()
+                })
+                .collect();
+            MediaRelation::upsert(&db, &relations)
+                .await
+                .unwrap();
+            // Tag both content kinds and a genre to catch scope-alias mistakes.
+            for id in [1, 3, 6] {
+                sqlx::query("INSERT INTO media_tags (media_id, tag) VALUES (?, ?)")
+                    .bind(Uuid::from_u128(id))
+                    .bind("provider:netflix")
+                    .execute(&db)
+                    .await
+                    .unwrap();
+            }
+            let filter = MediaFilter {
+                kind: Some(vec![MediaKind::Genre, MediaKind::MusicGenre]),
+                genre_related_kinds: Some(vec![MediaKind::Series, MediaKind::Episode]),
+                parent_id: Some(parent.id),
+                parent: Some(parent),
+                filter_rules: Some(rules),
+                total_count: true,
+                ..Default::default()
+            };
+            (db, filter)
+        }
+
+        #[tokio::test]
+        async fn empty_rules_return_distinct_series_genres_in_fallback_order() {
+            let (db, filter) = fixture().await;
+            let result = Media::get_by_filter(&db, &filter)
+                .await
+                .unwrap();
+            let ids: Vec<_> = result
+                .records
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(ids, [7, 6, 4, 5].map(Uuid::from_u128));
+            assert_eq!(
+                result.total_count,
+                result
+                    .records
+                    .len()
+            );
+        }
+
+        #[tokio::test]
+        async fn tag_rules_match_series_not_genres_or_movies() {
+            let (db, mut filter) = fixture().await;
+            filter
+                .filter_rules
+                .as_mut()
+                .unwrap()
+                .groups[0]
+                .rules = vec![FilterRule::Tag {
+                op: SetOp::In,
+                values: vec!["provider:netflix".into()],
+            }];
+            let result = Media::get_by_filter(&db, &filter)
+                .await
+                .unwrap();
+            let ids: Vec<_> = result
+                .records
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(ids, [4, 5].map(Uuid::from_u128));
+            assert_eq!(
+                result.total_count,
+                result
+                    .records
+                    .len()
+            );
+        }
     }
 
     #[test]
