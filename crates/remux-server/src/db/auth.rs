@@ -61,8 +61,8 @@ impl Device {
         crate::jellyfin_client::from_device(self)
     }
 
-    pub async fn save(&self, db: &SqlitePool) -> Result<()> {
-        sqlx::query(
+    pub async fn save(&mut self, db: &SqlitePool) -> Result<()> {
+        self.access_token = sqlx::query_scalar(
             r#"
             INSERT INTO devices
                 (user_id, access_token, id, name, app_name, app_version, created_at)
@@ -70,9 +70,9 @@ impl Device {
                 (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id, user_id) DO UPDATE SET
                 name = excluded.name,
-                access_token = excluded.access_token,
                 app_name    = excluded.app_name,
                 app_version = excluded.app_version
+            RETURNING access_token
             "#,
         )
         .bind(self.user_id)
@@ -82,7 +82,7 @@ impl Device {
         .bind(&self.app_name)
         .bind(&self.app_version)
         .bind(Utc::now())
-        .execute(db)
+        .fetch_one(db)
         .await?;
 
         Ok(())
@@ -868,6 +868,215 @@ mod tests {
         .save(db)
         .await
         .unwrap();
+    }
+
+    fn login_device(id: &str, user_id: Uuid) -> Device {
+        Device::new_from_header(
+            JellyfinAuthHeader {
+                device_id: Some(id.to_string()),
+                ..Default::default()
+            },
+            &db::User {
+                id: user_id,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeated_device_login_preserves_token_and_creation_time() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let mut first = login_device("same-device", user_id);
+        first
+            .save(&db)
+            .await
+            .unwrap();
+        let original = Device::get_by_access_token(
+            &db,
+            first
+                .access_token
+                .expose(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut second = login_device("same-device", user_id);
+        second.name = "Renamed device".to_string();
+        second.app_name = "Updated client".to_string();
+        second.app_version = "2.0".to_string();
+        second
+            .save(&db)
+            .await
+            .unwrap();
+
+        assert!(
+            first
+                .access_token
+                .expose()
+                == second
+                    .access_token
+                    .expose()
+        );
+        let stored = Device::get_by_access_token(
+            &db,
+            first
+                .access_token
+                .expose(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.name, "Renamed device");
+        assert_eq!(stored.app_name, "Updated client");
+        assert_eq!(stored.app_version, "2.0");
+        assert_eq!(stored.created_at, original.created_at);
+        assert_eq!(
+            Device::get_all(&db, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn same_device_id_keeps_users_tokens_separate() {
+        let db = test_db().await;
+        let mut first = login_device("shared-device", Uuid::new_v4());
+        let mut second = login_device("shared-device", Uuid::new_v4());
+        first
+            .save(&db)
+            .await
+            .unwrap();
+        second
+            .save(&db)
+            .await
+            .unwrap();
+
+        assert!(
+            first
+                .access_token
+                .expose()
+                != second
+                    .access_token
+                    .expose()
+        );
+        assert_eq!(
+            Device::get_all(&db, None)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        for device in [&first, &second] {
+            let stored = Device::get_by_access_token(
+                &db,
+                device
+                    .access_token
+                    .expose(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(stored.user_id, device.user_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn device_login_after_logout_issues_new_token() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let mut first = login_device("same-device", user_id);
+        first
+            .save(&db)
+            .await
+            .unwrap();
+        assert!(
+            Device::delete_by_access_token(
+                &db,
+                first
+                    .access_token
+                    .expose()
+            )
+            .await
+            .unwrap()
+        );
+
+        let mut second = login_device("same-device", user_id);
+        second
+            .save(&db)
+            .await
+            .unwrap();
+        assert!(
+            first
+                .access_token
+                .expose()
+                != second
+                    .access_token
+                    .expose()
+        );
+        assert!(
+            Device::get_by_access_token(
+                &db,
+                first
+                    .access_token
+                    .expose()
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            Device::get_by_access_token(
+                &db,
+                second
+                    .access_token
+                    .expose()
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_first_device_logins_return_persisted_token() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let mut first = login_device("new-device", user_id);
+        let mut second = login_device("new-device", user_id);
+        let (a, b) = tokio::join!(first.save(&db), second.save(&db));
+        a.unwrap();
+        b.unwrap();
+
+        assert!(
+            first
+                .access_token
+                .expose()
+                == second
+                    .access_token
+                    .expose()
+        );
+        let stored = Device::get_by_access_token(
+            &db,
+            first
+                .access_token
+                .expose(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.user_id, user_id);
+        assert_eq!(
+            Device::get_all(&db, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// An API key authenticates without a row in `devices`, so its session gets
