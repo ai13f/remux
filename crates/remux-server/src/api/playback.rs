@@ -54,7 +54,10 @@ use crate::{
         session::{TranscodeSession, TranscodeState},
     },
     sdks,
-    services::{MediaResolveService, ProbeResult, StreamService, StreamServiceConfig},
+    services::{
+        MediaResolveService, ProbeResult, StreamService, StreamServiceConfig,
+        language_gate,
+    },
     torrent,
 };
 use axum_anyhow::ApiResult as Result;
@@ -216,7 +219,15 @@ async fn items_playbackinfo_inner(
     id: Uuid,
     mut q: api::PlaybackInfoQuery,
 ) -> Result<impl IntoResponse> {
-    let media_source_id = q.media_source_id;
+    // Search and catalog results carry transient ids. Key the response on the
+    // persisted item so its routes and playback history use the stable id.
+    let raw_id = id;
+    let id = MediaResolveService::resolve_item(raw_id, &state.ctx)
+        .await?
+        .map_or(raw_id, |media| media.id);
+    let media_source_id = q
+        .media_source_id
+        .map(|source_id| if source_id == raw_id { id } else { source_id });
 
     trace!(?id, ?q, "items_playbackinfo");
 
@@ -376,6 +387,36 @@ async fn items_playbackinfo_inner(
         .log_err("failed to load inherited original language")
         .ok()
         .flatten();
+    // Strict-language users play a qualifying track even when the file's
+    // default audio is another language. Ranking judges each source by that
+    // track, so it is known before probing.
+    let strict_original = if language_gate::enabled(
+        session
+            .user
+            .policy
+            .as_deref(),
+    ) {
+        // `id` is the top-level Movie/Episode; `media` is it unless the
+        // request names a source.
+        let item = match media_source_id {
+            None => Some(media.clone()),
+            Some(_) => db::Media::get_by_id(
+                &state
+                    .ctx
+                    .db,
+                &id,
+            )
+            .await
+            .ok()
+            .flatten(),
+        };
+        Some(match &item {
+            Some(item) => language_gate::original_language(&state.ctx, item).await,
+            None => selected_source_language.clone(),
+        })
+    } else {
+        None
+    };
 
     let max_bitrate: Option<i64> = match (
         q.max_streaming_bitrate,
@@ -479,6 +520,9 @@ async fn items_playbackinfo_inner(
         requested_subtitle: q.subtitle_stream_index,
         remembered_audio: saved_audio,
         remembered_subtitle: saved_subtitle,
+        strict_original: strict_original
+            .as_ref()
+            .map(|original| original.as_deref()),
     };
 
     let port = state
@@ -520,6 +564,18 @@ async fn items_playbackinfo_inner(
         }
     );
     let probed = probed?;
+    let described_streams: std::collections::HashMap<Uuid, Uuid> = probed
+        .results
+        .iter()
+        .map(|r| {
+            (
+                r.source
+                    .id,
+                r.effective_stream
+                    .id,
+            )
+        })
+        .collect();
     let item_runtime_seconds = subtitle_media
         .as_ref()
         .and_then(|item| item.runtime);
@@ -586,6 +642,17 @@ async fn items_playbackinfo_inner(
         // can do with them.
         // Must run before resolve_default_streams below, so a dropped stream
         // can never end up as the resolved default (a dangling index).
+        //
+        // A strict-language user's source may qualify only through an
+        // embedded text subtitle (`language_gate::rescue_subtitle`). That
+        // track survives here exactly when it is deliverable (Embed per the
+        // profile, or External with extraction allowed); text has no burn-in
+        // path, so a source that loses it is rejected below.
+        let strict_qualified = strict_original
+            .as_ref()
+            .map(|original| {
+                language_gate::qualifying_tracks(&source, original.as_deref()).is_some()
+            });
         source
             .media_streams
             .retain(|s| {
@@ -603,13 +670,33 @@ async fn items_playbackinfo_inner(
         // covers it — no reason to offer the slow path when a fast one
         // exists. Must also run before resolve_default_streams below.
         // Gated on the dedup setting: with it off, the user asked to see
-        // every subtitle option, embedded ones included.
+        // every subtitle option, embedded ones included. A strict user's
+        // rescue subtitle is never replaced.
         if subtitle_dedup.enabled {
+            let keep = strict_original
+                .as_ref()
+                .and_then(|original| {
+                    language_gate::rescue_subtitle(&source, original.as_deref())
+                });
             drop_unsupported_embedded_subtitles_with_external_match(
                 &mut source,
                 &external_subtitles,
                 device_profile.as_ref(),
+                keep,
             );
+        }
+        if let (Some(original), Some(qualified)) = (&strict_original, strict_qualified)
+            && language_gate::lost_qualification(
+                qualified,
+                &source,
+                original.as_deref(),
+            )
+        {
+            debug!(
+                stream_id = %effective_stream.id,
+                "strict-language source rejected: its qualifying subtitle cannot be delivered to this device"
+            );
+            continue;
         }
 
         // Resolve default audio/subtitle stream indexes for this source. These are
@@ -625,6 +712,12 @@ async fn items_playbackinfo_inner(
             saved_audio,
             saved_subtitle,
         );
+        if let Some(original) = &strict_original
+            && q.audio_stream_index
+                .is_none()
+        {
+            language_gate::select_tracks(&mut source, original.as_deref());
+        }
         let effective_sub_idx = q
             .subtitle_stream_index
             .or(source.default_subtitle_stream_index);
@@ -896,6 +989,12 @@ async fn items_playbackinfo_inner(
             saved_audio,
             saved_subtitle,
         );
+        if let Some(original) = &strict_original
+            && q.audio_stream_index
+                .is_none()
+        {
+            language_gate::select_tracks(source, original.as_deref());
+        }
     }
 
     // Only the source that will actually play gets a background extraction.
@@ -951,6 +1050,20 @@ async fn items_playbackinfo_inner(
             .id,
     );
 
+    // Pin every id this response hands out (group ids, stream ids) to the
+    // stream it describes, so this play session's stream and HLS requests
+    // serve exactly that file rather than re-resolving the id. The item id
+    // auto-play rewrites source[0] to is saved by `save_selected_stream`.
+    for source in &media_sources {
+        if let Some(&stream_id) = described_streams.get(&source.id) {
+            StreamService::pin_source(
+                &state.ctx,
+                &play_session_id,
+                source.id,
+                stream_id,
+            );
+        }
+    }
     // When no specific stream was requested (initial load, or media_source_id == item_id),
     // override source[0].Id to equal the item ID — clients expect this for auto-play.
     // Group and specific-stream requests keep their own UUIDs (specific_stream_requested = true).
@@ -3181,6 +3294,46 @@ mod tests {
         );
     }
 
+    /// Search/catalog results carry transient ids aliased to a persisted item.
+    /// PlaybackInfo must answer with the persisted id, or the client's stream
+    /// and progress requests key on an id nothing else knows.
+    #[tokio::test]
+    async fn test_playbackinfo_answers_with_the_persisted_item_id() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let media = insert_test_source(&guard.0).await;
+        let transient = uuid::Uuid::new_v4();
+        guard
+            .0
+            .store
+            .save(
+                transient.to_string(),
+                media.id,
+                std::time::Duration::from_secs(60),
+            );
+
+        let resp = server
+            .post(&format!("/items/{transient}/playbackinfo"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({ "MediaSourceId": transient.to_string() }))
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["Id"],
+            json!(
+                media
+                    .id
+                    .simple()
+                    .to_string()
+            )
+        );
+    }
+
     /// A device profile that supports direct play causes the endpoint to return a direct-play response.
     #[tokio::test]
     async fn test_playbackinfo_direct_play_profile() {
@@ -4763,6 +4916,171 @@ mod tests {
             Some(1),
             "Client's explicit AudioStreamIndex must prevent language preference from selecting Dutch (index 1)"
         );
+    }
+
+    /// Make the test user strict (`remux.require_english_spanish`).
+    async fn make_test_user_strict(ctx: &crate::AppContext) {
+        use remux_sdks::remux::{UserPolicy, UserPolicyRemux};
+        let mut user = crate::db::User::get_by_username(&ctx.db, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        user.policy = Some(sqlx::types::Json(UserPolicy {
+            remux: Some(UserPolicyRemux {
+                require_english_spanish: true,
+            }),
+            ..Default::default()
+        }));
+        user.save(&ctx.db)
+            .await
+            .unwrap();
+    }
+
+    /// A locally probed Japanese-original source with only Japanese audio and
+    /// a full embedded English SRT (index 2): strict-playable only through
+    /// that subtitle. `extraction_addon` lets its subtitles be extracted.
+    async fn insert_strict_rescue_source(
+        ctx: &crate::AppContext,
+        extraction_addon: Option<uuid::Uuid>,
+    ) -> crate::db::Media {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db,
+        };
+        let now = chrono::Utc::now().naive_utc();
+        let probe = MediaSourceInfo {
+            container: Some(VideoContainer::Mkv),
+            bitrate: Some(8_000_000),
+            run_time_ticks: Some(100_000_000),
+            media_streams: vec![
+                MediaStream {
+                    codec: Some("h264".to_string()),
+                    ref_frames: Some(1),
+                    type_: Some(MediaStreamType::Video),
+                    index: 0,
+                    width: Some(1920),
+                    height: Some(1080),
+                    ..Default::default()
+                },
+                MediaStream {
+                    codec: Some("aac".to_string()),
+                    type_: Some(MediaStreamType::Audio),
+                    index: 1,
+                    language: Some("jpn".to_string()),
+                    ..Default::default()
+                },
+                MediaStream {
+                    codec: Some("subrip".to_string()),
+                    type_: Some(MediaStreamType::Subtitle),
+                    index: 2,
+                    language: Some("eng".to_string()),
+                    is_text_subtitle_stream: true,
+                    ..Default::default()
+                },
+            ],
+            remux: Some(crate::api::MediaSourceRemuxInfo {
+                source: Some(crate::api::ProbeOrigin::Ffprobe),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut media = db::Media {
+            title: "Strict Rescue Test".to_string(),
+            kind: db::MediaKind::Stream,
+            original_language: Some("ja".to_string()),
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(
+                    "test-fixture-strict-rescue.mkv".into(),
+                ),
+                addon_id: extraction_addon,
+                ..Default::default()
+            }),
+            probe_data: Some(probe),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        media
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        media
+    }
+
+    /// A strict user's source playable only through its embedded English
+    /// subtitle, for a device that can't take that subtitle (no
+    /// DeviceProfile to embed it, extraction off) and no burn-in path for
+    /// text: the source is not strict-playable and must not be advertised.
+    #[tokio::test]
+    async fn strict_rescue_source_is_rejected_when_its_subtitle_cannot_be_delivered() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        make_test_user_strict(&guard.0).await;
+        let media = insert_strict_rescue_source(&guard.0, None).await;
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        // With no playable source left PlaybackInfo answers its usual
+        // "No streams found" placeholder, which has no audio at all.
+        let sources = body["MediaSources"]
+            .as_array()
+            .unwrap();
+        assert!(
+            sources
+                .iter()
+                .all(|s| {
+                    s["Name"] == "No streams found"
+                        && s["MediaStreams"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|m| m["Type"] != "Audio")
+                }),
+            "a source whose qualifying subtitle can't be delivered must be rejected: {sources:?}"
+        );
+    }
+
+    /// With extraction allowed the same source keeps its English subtitle,
+    /// delivered External, as the default.
+    #[tokio::test]
+    async fn strict_rescue_source_keeps_its_subtitle_as_external_default() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        make_test_user_strict(&guard.0).await;
+        let addon_id = insert_extraction_addon(&guard.0).await;
+        let media = insert_strict_rescue_source(&guard.0, Some(addon_id)).await;
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let source = &body["MediaSources"][0];
+        let english = source["MediaStreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["Type"] == "Subtitle" && s["Index"] == 2)
+            .unwrap_or_else(|| panic!("English subtitle missing: {source}"));
+        assert_eq!(english["Language"], "eng");
+        assert_eq!(english["DeliveryMethod"], "External");
+        assert_eq!(source["DefaultSubtitleStreamIndex"], 2);
+        assert_eq!(source["DefaultAudioStreamIndex"], 1);
     }
 
     /// Insert an addon row that has opted in to subtitle extraction.

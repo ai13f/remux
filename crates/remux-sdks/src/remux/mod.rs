@@ -3426,6 +3426,14 @@ pub enum SyncPlayUserAccessType {
     None,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UserPolicyRemux {
+    /// Play only sources whose probed audio is English or Spanish, or whose
+    /// original-language audio has a full embedded English/Spanish subtitle.
+    #[serde(default)]
+    pub require_english_spanish: bool,
+}
+
 #[dto]
 pub struct UserPolicy {
     pub is_administrator: bool,
@@ -3449,6 +3457,8 @@ pub struct UserPolicy {
     pub filter_rules: Option<CollectionFilter>,
     /// Per-user stream filter applied during playback. Restricts which streams are offered.
     pub stream_filter: Option<StreamFilter>,
+    #[serde(rename = "remux")]
+    pub remux: Option<UserPolicyRemux>,
     /// When false, search falls back to local DB only (no addon/remote sources).
     #[serde(default = "default_true")]
     #[default(true)]

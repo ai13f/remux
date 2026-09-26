@@ -1,5 +1,6 @@
 pub(crate) mod four_k_capability;
 pub mod image;
+pub(crate) mod language_gate;
 pub mod media_tracker;
 pub(crate) mod resolve;
 pub mod stream_provider;
