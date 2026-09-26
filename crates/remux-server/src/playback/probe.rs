@@ -726,7 +726,51 @@ pub fn probe_media_with(
     {
         output = run_ffprobe(&ffprobe_args(url, true, headers), deadline)?;
     }
+    parse_probe_output(url, output)
+}
 
+/// `probe_media` for async callers: ffprobe is killed when `limit` elapses or
+/// the future is dropped, instead of lingering on a blocking thread.
+pub(crate) async fn probe_media_bounded(
+    url: &str,
+    limit: std::time::Duration,
+) -> Result<(api::MediaSourceInfo, MediaSegments)> {
+    let run = |relaxed| {
+        let mut command = std::process::Command::new(ffprobe_bin());
+        command
+            .args(ffprobe_args(url, relaxed, None))
+            .hide_console();
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(true);
+        async move {
+            command
+                .output()
+                .await
+                .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))
+        }
+    };
+    tokio::time::timeout(limit, async {
+        let mut output = run(false).await?;
+        if !output
+            .status
+            .success()
+            && should_retry_with_relaxed_hls_extensions(&String::from_utf8_lossy(
+                &output.stderr,
+            ))
+        {
+            output = run(true).await?;
+        }
+        parse_probe_output(url, output)
+    })
+    .await
+    .map_err(|_| anyhow!("ffprobe timed out after {}s", limit.as_secs()))?
+}
+
+fn parse_probe_output(
+    url: &str,
+    output: std::process::Output,
+) -> Result<(api::MediaSourceInfo, MediaSegments)> {
+    let shown = redact_url(url);
     if !output
         .status
         .success()
@@ -1400,6 +1444,32 @@ pub(crate) async fn probe_stream(
     }
 }
 
+/// Probed duration (ticks) under which a video is an error/copyright-strike
+/// placeholder rather than the title: half the known runtime capped at five
+/// minutes, or three minutes when the runtime is unknown. Returns the
+/// threshold when `probed` falls under it. Audio-only streams are exempt,
+/// since short songs are legitimate.
+pub(crate) fn placeholder_threshold(
+    stream: &db::Media,
+    probed: &api::MediaSourceInfo,
+) -> Option<i64> {
+    probed.video_stream()?;
+    let probed_ticks = probed.run_time_ticks?;
+    let max_threshold = 5_i64
+        .to_ticks(TickUnit::Minutes)
+        .unwrap_or(0);
+    let threshold = match stream.runtime {
+        Some(known_secs) => known_secs
+            .to_ticks(TickUnit::Seconds)
+            .map(|t| (t / 2).min(max_threshold))
+            .unwrap_or(max_threshold),
+        None => 3_i64
+            .to_ticks(TickUnit::Minutes)
+            .unwrap_or(0),
+    };
+    (probed_ticks < threshold).then_some(threshold)
+}
+
 fn select_candidates(
     primary: &db::Media,
     probe_pool: &[db::Media],
@@ -1534,39 +1604,16 @@ where
 
         match probe_result {
             Ok(Ok(Ok((mut probed, segments)))) => {
-                // Reject streams whose probed duration is suspiciously short
-                // relative to the known metadata runtime (or absolutely < 3 min
-                // when unknown) — these are typically error/copyright-strike
-                // placeholder videos, not real content. Skip for audio-only
-                // streams since short songs are legitimate.
-                if probed
-                    .video_stream()
-                    .is_some()
-                    && let Some(probed_ticks) = probed.run_time_ticks
-                {
-                    let max_threshold = 5_i64
-                        .to_ticks(TickUnit::Minutes)
-                        .unwrap_or(0);
-                    let threshold_ticks = match stream.runtime {
-                        Some(known_secs) => known_secs
-                            .to_ticks(TickUnit::Seconds)
-                            .map(|t| (t / 2).min(max_threshold))
-                            .unwrap_or(max_threshold),
-                        None => 3_i64
-                            .to_ticks(TickUnit::Minutes)
-                            .unwrap_or(0),
-                    };
-                    if probed_ticks < threshold_ticks {
-                        warn!(
-                            id = %stream.id,
-                            url = %redact_url(&url),
-                            probed_ticks,
-                            threshold_ticks,
-                            known_runtime_secs = ?stream.runtime,
-                            "stream is suspiciously short, treating as probe failure"
-                        );
-                        continue;
-                    }
+                if let Some(threshold_ticks) = placeholder_threshold(&stream, &probed) {
+                    warn!(
+                        id = %stream.id,
+                        url = %redact_url(&url),
+                        probed_ticks = ?probed.run_time_ticks,
+                        threshold_ticks,
+                        known_runtime_secs = ?stream.runtime,
+                        "stream is suspiciously short, treating as probe failure"
+                    );
+                    continue;
                 }
 
                 if probed

@@ -26,6 +26,7 @@ use crate::{
         session::{SegmentContainer, TranscodeSession, TranscodeState},
     },
     playback_session::{FfmpegTrack, ServedPlayback},
+    services::{StreamService, language_gate},
 };
 
 /// Serializes the lookup-or-create-transcode sequence per play_session_id so
@@ -183,9 +184,13 @@ async fn create_hls_session(
         .context_not_found("media not found")?;
 
         let mut resolved_media = media.clone();
+        let user_id = Some(
+            auth.user
+                .id,
+        );
         if resolved_media.kind == db::MediaKind::StreamGroup {
             let gid = resolved_media.id;
-            let candidates = db::StreamGroup::streams_for(
+            let mut candidates = db::StreamGroup::streams_for(
                 &state
                     .ctx
                     .db,
@@ -193,6 +198,18 @@ async fn create_hls_session(
                 &id,
             )
             .await?;
+            if let Some(item) = db::Media::get_by_id(
+                &state
+                    .ctx
+                    .db,
+                &id,
+            )
+            .await?
+            {
+                candidates =
+                    language_gate::playable_for(&state.ctx, user_id, &item, candidates)
+                        .await?;
+            }
             resolved_media = candidates
                 .into_iter()
                 .next()
@@ -221,20 +238,27 @@ async fn create_hls_session(
                         .db,
                 )
                 .await?;
-            resolved_media = if let Some(wanted) = q.media_source_id {
-                sources
-                    .iter()
-                    .find(|s| s.id == wanted)
-                    .cloned()
-            } else {
-                None
-            }
-            .or_else(|| {
-                sources
-                    .into_iter()
-                    .next()
-            })
-            .context_not_found("no playable source found")?;
+            let sources = language_gate::playable_for(
+                &state.ctx,
+                user_id,
+                &resolved_media,
+                sources,
+            )
+            .await?;
+            let wanted = q
+                .media_source_id
+                .and_then(|wanted| {
+                    sources
+                        .iter()
+                        .find(|s| s.id == wanted)
+                        .cloned()
+                });
+            resolved_media = match wanted {
+                Some(source) => source,
+                None => StreamService::autoplay_source(&state.ctx, sources)
+                    .await
+                    .context_not_found("no playable source found")?,
+            };
         } else if resolved_media.kind == db::MediaKind::Track {
             let sources = resolved_media
                 .streams(

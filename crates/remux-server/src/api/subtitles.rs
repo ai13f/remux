@@ -937,6 +937,24 @@ async fn subtitles_stream_inner(
             } else {
                 None
             };
+            // PlaybackInfo's dedup keeps a strict-language user's rescue
+            // subtitle (`language_gate::rescue_subtitle`), so it must here too.
+            let strict_original = if crate::services::language_gate::enabled(
+                session
+                    .user
+                    .policy
+                    .as_deref(),
+            ) {
+                Some(
+                    crate::services::language_gate::original_language(
+                        &state.ctx,
+                        &item_media,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
             // Only the embedded streams PlaybackInfo kept, dropped by the same
             // two steps in the same order: add-on externals are numbered after
             // those, not after every probed stream.
@@ -954,11 +972,20 @@ async fn subtitles_stream_inner(
                                 subtitle_mode,
                             )
                         });
-                    if let Some(ref subs) = subs {
+                    if let Some(subs) = &subs {
+                        let keep = strict_original
+                            .as_ref()
+                            .and_then(|original| {
+                                crate::services::language_gate::rescue_subtitle(
+                                    &probe,
+                                    original.as_deref(),
+                                )
+                            });
                         drop_unsupported_embedded_subtitles_with_external_match(
                             &mut probe,
                             subs,
                             device_profile.as_ref(),
+                            keep,
                         );
                     }
                     probe
@@ -1510,16 +1537,22 @@ fn has_supported_embedded_subtitle(
 /// transcode is needed. Removing the stream from `media_streams` here is
 /// what keeps them from ever considering it; this function doesn't (and
 /// shouldn't need to) touch their logic.
+///
+/// `keep` is a strict-language user's rescue subtitle
+/// (`language_gate::rescue_subtitle`): the source is only playable through
+/// that embedded track, so an external copy never replaces it.
 pub(crate) fn drop_unsupported_embedded_subtitles_with_external_match(
     source: &mut api::MediaSourceInfo,
     external_subtitles: &[crate::addons::SubtitleInfo],
     device_profile: Option<&api::DeviceProfile>,
+    keep: Option<i64>,
 ) {
     source
         .media_streams
         .retain(|stream| {
             if stream.type_ != Some(api::MediaStreamType::Subtitle)
                 || stream.is_external
+                || keep == Some(stream.index)
             {
                 return true;
             }
@@ -2134,6 +2167,7 @@ mod tests {
             &mut source,
             &[external],
             Some(&no_embed_profile()),
+            None,
         );
         assert!(
             source
@@ -2161,6 +2195,7 @@ mod tests {
             &mut source,
             &[external],
             Some(&no_embed_profile()),
+            None,
         );
         assert_eq!(
             source
@@ -2195,6 +2230,7 @@ mod tests {
             &mut source,
             &[external],
             Some(&profile),
+            None,
         );
         assert_eq!(
             source

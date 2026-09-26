@@ -80,6 +80,16 @@ File logging is enabled by default and writes daily rolling logs under `<data_di
 
 The dashboard log endpoint requires an administrator session and redacts common credential-shaped values, but arbitrary log content can still contain sensitive information. Treat logs as sensitive and do not rely on redaction as a complete secret scanner.
 
+### Strict playback languages (patched server)
+
+Merge `{"remux":{"require_english_spanish":true}}` into a user's complete
+`Policy` (`POST /Users/{id}/Policy`). That user then plays only sources whose
+local ffprobe shows English or Spanish audio, or the title's original-language
+audio with a full embedded English/Spanish text subtitle; the qualifying track
+becomes the default. Unverified sources are probed (three at a time) when the
+user plays a title, and the request waits up to 20 s for its best-ranked source.
+Results persist in the source's probe data; failed probes retry after 10 min.
+
 ### Development
 
 Install cargo make

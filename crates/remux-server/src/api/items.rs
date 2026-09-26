@@ -1755,6 +1755,7 @@ async fn rank_item_sources(
             requested_subtitle: None,
             remembered_audio,
             remembered_subtitle,
+            strict_original: None,
         },
     )
     .await;

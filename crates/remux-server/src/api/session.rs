@@ -159,12 +159,29 @@ pub async fn sessions_capabilities_by_id(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Search and catalog results carry transient ids; record history on the
+/// persisted item. Best effort: a report must never fail on resolution.
+async fn canonical_playback_item(state: &AppState, data: &mut api::PlaybackInfo) {
+    if data
+        .item_id
+        .is_nil()
+    {
+        return;
+    }
+    if let Ok(Some(media)) =
+        MediaResolveService::resolve_item(data.item_id, &state.ctx).await
+    {
+        data.item_id = media.id;
+    }
+}
+
 #[post("/sessions/playing")]
 pub async fn report_playback_start(
     State(state): State<AppState>,
     session: auth::AuthSession,
-    Json(data): Json<api::PlaybackInfo>,
+    Json(mut data): Json<api::PlaybackInfo>,
 ) -> Result<impl IntoResponse> {
+    canonical_playback_item(&state, &mut data).await;
     state
         .ctx
         .sessions
@@ -218,8 +235,9 @@ pub async fn report_playback_start(
 pub async fn report_playback_progress(
     State(state): State<AppState>,
     session: auth::AuthSession,
-    Json(data): Json<api::PlaybackInfo>,
+    Json(mut data): Json<api::PlaybackInfo>,
 ) -> Result<impl IntoResponse> {
+    canonical_playback_item(&state, &mut data).await;
     // Jellyfin clients keep reporting while paused, so the transition is what
     // marks a real pause; the position is read before the session is updated.
     let was_paused = state
@@ -326,8 +344,9 @@ pub async fn report_playback_progress(
 pub async fn report_playback_stopped(
     State(state): State<AppState>,
     session: auth::AuthSession,
-    Json(data): Json<api::PlaybackInfo>,
+    Json(mut data): Json<api::PlaybackInfo>,
 ) -> Result<impl IntoResponse> {
+    canonical_playback_item(&state, &mut data).await;
     let effective_psid = data
         .play_session_id
         .clone()
