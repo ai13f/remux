@@ -1023,7 +1023,8 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         };
         if let Some(ref filter) = vf {
             args.extend(["-vf".into(), filter.clone()]);
-        } else if let Some(audio_idx) = params.audio_stream_index {
+        }
+        if let Some(audio_idx) = params.audio_stream_index {
             args.extend([
                 "-map".into(),
                 "0:v:0".into(),
@@ -1837,7 +1838,8 @@ pub(crate) fn build_progressive_args(
         };
         if let Some(ref filter) = vf {
             args.extend(["-vf".into(), filter.clone()]);
-        } else if params
+        }
+        if params
             .audio_stream_index
             .is_some()
             || params
@@ -4408,6 +4410,25 @@ mod tests {
         });
         assert_eq!(arg_after(&args, "-f"), Some("mp4"));
         assert!(args_contains(&args, "-movflags"));
+    }
+
+    #[test]
+    fn progressive_scale_preserves_selected_audio_and_subtitle() {
+        let args = build_progressive_args(&ProgressiveTranscodeParams {
+            video_codec: "libx264".into(),
+            max_width: Some(1280),
+            audio_stream_index: Some(3),
+            subtitle_stream_index: Some(5),
+            ..default_progressive()
+        });
+
+        assert!(arg_after(&args, "-vf").is_some(), "-vf missing");
+        let maps: Vec<_> = args
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(maps, ["0:v:0", "0:3", "0:5?"]);
     }
 
     #[test]
