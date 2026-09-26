@@ -1790,6 +1790,7 @@ async fn rank_item_sources(
             remembered_audio,
             remembered_subtitle,
             remembered_languages,
+            strict_original: None,
         },
         include_groups,
     )
