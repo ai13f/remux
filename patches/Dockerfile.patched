@@ -1,0 +1,4 @@
+# Official Remux image with only the patched server binary replaced.
+# Web UI, dashboard, ffmpeg and env come from the base image untouched.
+FROM BASE_IMAGE
+COPY remux-server /app/remux-server
