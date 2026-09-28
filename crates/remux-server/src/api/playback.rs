@@ -625,6 +625,9 @@ async fn items_playbackinfo_inner(
         // Keep the authoritative Movie/Episode duration in PlaybackInfo so
         // clients do not treat a normal VOD source as an indefinite stream.
         apply_item_runtime_fallback(&mut source, item_runtime_seconds);
+        // Before Strip mode below, so the label lists the file's languages
+        // whatever this device can render.
+        language_gate::annotate_languages(&mut source);
 
         if has_lyrics {
             api::inject_lyric_stream(&mut source);
@@ -3530,6 +3533,46 @@ mod tests {
                 "SupportsDirectPlay": true,
             }]
         }));
+    }
+
+    #[tokio::test]
+    async fn test_playbackinfo_labels_locally_probed_source_languages() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let mut media = insert_test_source(&guard.0).await;
+        let probe = media
+            .probe_data
+            .as_mut()
+            .unwrap();
+        probe.media_streams[1].language = Some("eng".into());
+        probe.remux = Some(crate::api::MediaSourceRemuxInfo {
+            source: Some(crate::api::ProbeOrigin::Ffprobe),
+            ..Default::default()
+        });
+        media
+            .save(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let name = body["MediaSources"][0]["Name"]
+            .as_str()
+            .unwrap();
+        assert!(name.ends_with(" | Audio: EN"), "{name}");
     }
 
     #[tokio::test]
