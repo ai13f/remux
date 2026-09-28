@@ -1530,6 +1530,87 @@ mod e2e_tests {
         );
     }
 
+    /// A client that never reports a start has the stop as its only playback
+    /// signal. That stop must date the resume point, or Continue Watching sorts
+    /// the item behind every older dated one.
+    #[tokio::test]
+    async fn stop_report_without_play_session_dates_the_resume_point() {
+        let (server, ctx, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let user = crate::db::User::get_by_username(
+            &ctx.0
+                .db,
+            "test",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let older = crate::integration_test::insert_test_source(&ctx.0).await;
+        sqlx::query(
+            "INSERT INTO user_media_state (user_id, media_id, playback_position, last_played_at) \
+             VALUES (?, ?, 60, '2026-01-01T10:00:00Z')",
+        )
+        .bind(user.id)
+        .bind(older.id)
+        .execute(&ctx.0.db)
+        .await
+        .unwrap();
+        let media = seed_movie(&ctx.0).await;
+        let item_id = media
+            .id
+            .simple()
+            .to_string();
+
+        let resp = server
+            .post("/sessions/playing/stopped")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": item_id,
+                "PositionTicks": 600_i64 * 10_000_000,
+            }))
+            .await;
+        resp.assert_status(StatusCode::NO_CONTENT);
+
+        let resp = server
+            .get("/users/me/items/resume")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let ids: Vec<&str> = body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                item["Id"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                item_id.as_str(),
+                older
+                    .id
+                    .simple()
+                    .to_string()
+                    .as_str()
+            ],
+            "the just-stopped item must lead Continue Watching"
+        );
+        assert!(
+            body["Items"][0]["UserData"]["LastPlayedDate"].is_string(),
+            "the stop must set LastPlayedDate"
+        );
+    }
+
     /// A session-less stop under the resume threshold on an item with no prior
     /// state must leave no trace: no resume point, and no `LastPlayedDate`
     /// either — Jellyfin only writes that on playback start, which such a

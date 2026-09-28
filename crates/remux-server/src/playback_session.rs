@@ -653,6 +653,13 @@ impl PlaybackSessionManager {
     /// `PlaySessionId`. Jellyfin persists that report regardless of session
     /// state, so dropping it would lose Continue Watching for those clients.
     ///
+    /// A stop that keeps a resume point or completes the item also dates it
+    /// (`last_played_at`). For clients that never report a start, the stop
+    /// is the only playback signal. Without a date, Continue Watching sorts
+    /// their items behind every dated one and Next Up drops series whose only
+    /// activity is in progress. An abandoned stop (under the resume
+    /// threshold) still writes no date.
+    ///
     /// Returns whether this stop crossed the watched threshold.
     pub async fn persist_stop(
         db: &sqlx::SqlitePool,
@@ -669,7 +676,7 @@ impl PlaybackSessionManager {
         let Ok(Some(media)) = db::Media::get_by_id(db, &item_id).await else {
             return Ok(false);
         };
-        db::UserMediaState::update_playback(
+        let played = db::UserMediaState::update_playback(
             db,
             user,
             &media,
@@ -678,7 +685,18 @@ impl PlaybackSessionManager {
             None,
             media.runtime, // Some(runtime) triggers watched-threshold check
         )
-        .await
+        .await?;
+        sqlx::query(
+            "UPDATE user_media_state SET last_played_at = ? \
+             WHERE user_id = ? AND media_id = ? AND (? OR playback_position > 0)",
+        )
+        .bind(Utc::now().naive_utc())
+        .bind(user.id)
+        .bind(media.id)
+        .bind(played)
+        .execute(db)
+        .await?;
+        Ok(played)
     }
 
     /// Read the last persisted playback position for an item. This is used
