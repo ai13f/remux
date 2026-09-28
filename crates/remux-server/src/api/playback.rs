@@ -2742,6 +2742,148 @@ mod tests {
         );
     }
 
+    /// A strict-language user can stream without PlaybackInfo pinning a
+    /// source (a cold play answered with the no-streams placeholder, or a
+    /// client that builds the stream URL itself). The stream route must still
+    /// serve the first source that passes the language gate, not the first
+    /// in addon order.
+    #[tokio::test]
+    async fn stream_route_serves_a_strict_user_only_gated_sources() {
+        use crate::{addons::addon::Addon, api, db, stream};
+        use chrono::Utc;
+        use remux_sdks::{
+            remux::{AddonPresetRef, UserPolicy, UserPolicyRemux},
+            stremio::ResourceType,
+        };
+        use uuid::Uuid;
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let now = Utc::now().naive_utc();
+        let addon_id = Uuid::new_v4();
+
+        let mut user = db::User::get_by_username(&ctx.db, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        user.policy = Some(sqlx::types::Json(UserPolicy {
+            remux: Some(UserPolicyRemux {
+                require_english_spanish: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        user.save(&ctx.db)
+            .await
+            .unwrap();
+
+        // Redirecting makes the served source observable as `Location`.
+        Addon {
+            id: addon_id,
+            name: "gate-test-addon".to_string(),
+            preset: AddonPresetRef {
+                kind: "stremio".to_string(),
+                config: serde_json::json!({
+                    "manifest_url": "https://example.com/addon/manifest.json"
+                })
+                .into(),
+            },
+            resources: vec![ResourceType::Stream],
+            types: vec![],
+            enabled: true,
+            priority: 0,
+            system: false,
+            is_default: false,
+            http_redirect_stream: true,
+            subtitle_extraction: false,
+            probe_on_scan: false,
+            service_filter: vec![],
+            created_at: now,
+            updated_at: now,
+        }
+        .insert(&ctx.db)
+        .await
+        .unwrap();
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+
+        let mut movie = db::Media {
+            title: "Gate Test".to_string(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                imdb: db::NonEmptyString::try_new("tt9999998").ok(),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        movie.id = Uuid::from(&movie.media_id_raw());
+        movie
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(movie.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        // Addon order puts a locally probed Russian dub ahead of English.
+        for (idx, language) in [(0, "rus"), (1, "eng")] {
+            let mut source = db::Media {
+                title: format!("Gate Test {language}"),
+                kind: db::MediaKind::Stream,
+                parent_id: Some(movie.id),
+                idx: Some(idx),
+                stream_info: Some(stream::StreamInfo {
+                    descriptor: stream::StreamDescriptor::http(&format!(
+                        "https://cdn.example.com/{language}.mkv"
+                    )),
+                    addon_id: Some(addon_id),
+                    ..Default::default()
+                }),
+                probe_data: Some(api::MediaSourceInfo {
+                    media_streams: vec![api::MediaStream {
+                        codec: Some("aac".to_string()),
+                        type_: Some(api::MediaStreamType::Audio),
+                        index: 0,
+                        language: Some(language.to_string()),
+                        ..Default::default()
+                    }],
+                    remux: Some(api::MediaSourceRemuxInfo {
+                        source: Some(api::ProbeOrigin::Ffprobe),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            source
+                .save(&ctx.db)
+                .await
+                .unwrap();
+        }
+
+        let resp = server
+            .get(&format!("/videos/{}/stream", movie.id))
+            .add_query_params([("Static", "true"), ("ApiKey", &token)])
+            .expect_failure()
+            .await;
+
+        resp.assert_status(StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.header("location"),
+            "https://cdn.example.com/eng.mkv",
+            "a strict user must never be streamed the Russian dub"
+        );
+    }
+
     #[tokio::test]
     async fn test_playback_start() {
         let (server, _ctx, token) = authenticated_server().await;
