@@ -154,6 +154,69 @@ fn full_subtitle(stream: &api::MediaStream) -> bool {
         .any(partial_subtitle_label)
 }
 
+/// Append the source's languages to its name (`... | Audio: EN/JA | Subs: EN`)
+/// for version pickers. Only a local ffprobe is trusted, as in `verdict`.
+pub(crate) fn annotate_languages(source: &mut api::MediaSourceInfo) {
+    let local_probe = source
+        .remux
+        .as_ref()
+        .and_then(|remux| remux.source)
+        == Some(api::ProbeOrigin::Ffprobe);
+    if !local_probe {
+        return;
+    }
+    let mut audio = Vec::new();
+    let mut subtitles = Vec::new();
+    for track in &source.media_streams {
+        let languages = match track.type_ {
+            Some(MediaStreamType::Audio) => &mut audio,
+            Some(MediaStreamType::Subtitle) if full_subtitle(track) => &mut subtitles,
+            _ => continue,
+        };
+        let Some(mut lang) = language(
+            track
+                .language
+                .as_deref(),
+        ) else {
+            continue;
+        };
+        // The shared normalizer accepts arbitrary two-character tags.
+        if isolang::Language::from_639_1(&lang).is_none() {
+            continue;
+        }
+        lang.make_ascii_uppercase();
+        languages.push(lang);
+    }
+
+    let mut suffix = String::new();
+    for (label, mut languages) in [("Audio: ", audio), ("Subs: ", subtitles)] {
+        languages.sort_unstable_by(|a, b| {
+            (a != "EN", a != "ES", a).cmp(&(b != "EN", b != "ES", b))
+        });
+        languages.dedup();
+        if languages.is_empty() {
+            continue;
+        }
+        if !suffix.is_empty() {
+            suffix.push_str(" | ");
+        }
+        suffix.push_str(label);
+        suffix.push_str(&languages.join("/"));
+    }
+    if suffix.is_empty() {
+        return;
+    }
+    let name = source
+        .name
+        .get_or_insert_with(String::new);
+    if !name.ends_with(&suffix) {
+        if !name.is_empty() {
+            name.push_str(" | ");
+        }
+        name.push_str(&suffix);
+    }
+}
+
 /// The audio (and, for original-language audio, subtitle) track indexes that
 /// make `source` playable, preferring its current defaults.
 pub(crate) fn qualifying_tracks(
@@ -616,6 +679,59 @@ mod tests {
             qualifying_tracks(&subtitled, Some("ko")),
             None,
             "subtitles only rescue the title's original language"
+        );
+    }
+
+    #[test]
+    fn only_locally_probed_sources_are_labeled_with_their_languages() {
+        let mut forced = track(4, MediaStreamType::Subtitle, "spa", "subrip");
+        forced.is_forced = true;
+        let mut signs = track(5, MediaStreamType::Subtitle, "spa", "ass");
+        signs.title = Some("Signs & Songs".into());
+        let mut info = source(vec![
+            track(0, MediaStreamType::Video, "und", "h264"),
+            track(1, MediaStreamType::Audio, "jpn", "aac"),
+            track(2, MediaStreamType::Audio, "spa", "aac"),
+            track(3, MediaStreamType::Audio, "eng", "aac"),
+            track(6, MediaStreamType::Audio, "en-US", "aac"),
+            forced,
+            signs,
+            track(7, MediaStreamType::Subtitle, "spa", "hdmv_pgs_subtitle"),
+            track(8, MediaStreamType::Subtitle, "eng", "subrip"),
+        ]);
+        info.name = Some("4K".into());
+        let mut crowd = info.clone();
+        crowd.remux = Some(api::MediaSourceRemuxInfo {
+            source: Some(api::ProbeOrigin::RemuxDb),
+            ..Default::default()
+        });
+        let mut unprobed = info.clone();
+        info.remux = Some(api::MediaSourceRemuxInfo {
+            source: Some(api::ProbeOrigin::Ffprobe),
+            ..Default::default()
+        });
+
+        for _ in 0..2 {
+            annotate_languages(&mut info);
+            annotate_languages(&mut crowd);
+            annotate_languages(&mut unprobed);
+        }
+        assert_eq!(
+            info.name
+                .as_deref(),
+            Some("4K | Audio: EN/ES/JA | Subs: EN")
+        );
+        assert_eq!(
+            crowd
+                .name
+                .as_deref(),
+            Some("4K")
+        );
+        assert_eq!(
+            unprobed
+                .name
+                .as_deref(),
+            Some("4K")
         );
     }
 }
