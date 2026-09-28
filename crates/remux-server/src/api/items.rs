@@ -2090,6 +2090,16 @@ async fn item_for_user(
         }]);
     }
 
+    // Label sources with their probed languages before the subtitle strip
+    // below, so the label matches PlaybackInfo's (`| Subs: EN` included).
+    if want_streams {
+        if let Some(sources) = &mut base_item.media_sources {
+            for source in sources.iter_mut() {
+                crate::services::language_gate::annotate_languages(source);
+            }
+        }
+    }
+
     // Items detail never advertises subtitle tracks — neither embedded (from
     // probe data) nor addon-external. Addon subtitle fetches are the slow
     // part of building this response (multi-second network round trips per
@@ -5969,6 +5979,91 @@ mod tests {
             body["MediaSources"][0]["DefaultSubtitleStreamIndex"],
             serde_json::Value::Null,
             "Items detail must never set a default subtitle stream index"
+        );
+    }
+
+    /// The detail page hides subtitle tracks, but its version label must
+    /// still list the file's subtitle languages, as PlaybackInfo's does.
+    #[tokio::test]
+    async fn test_items_detail_labels_subtitle_languages_it_hides() {
+        let (server, guard, token) = authenticated_server().await;
+        use crate::api;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let now = Utc::now().naive_utc();
+        let movie =
+            insert_media(&ctx.db, "Label Test", db::MediaKind::Movie, "tt8888877")
+                .await;
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(movie.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        let track = |index, kind, language: &str, codec: &str| api::MediaStream {
+            codec: Some(codec.to_string()),
+            type_: Some(kind),
+            index,
+            language: Some(language.to_string()),
+            is_text_subtitle_stream: kind == api::MediaStreamType::Subtitle,
+            ..Default::default()
+        };
+        let mut stream = db::Media {
+            title: "LabelTest.2026.1080p.WEB-DL.mkv".to_string(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(movie.id),
+            idx: Some(0),
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(
+                    "LabelTest.2026.1080p.WEB-DL.mkv".into(),
+                ),
+                ..Default::default()
+            }),
+            probe_data: Some(api::MediaSourceInfo {
+                container: Some(VideoContainer::Mkv),
+                media_streams: vec![
+                    track(0, api::MediaStreamType::Video, "und", "h264"),
+                    track(1, api::MediaStreamType::Audio, "jpn", "aac"),
+                    track(2, api::MediaStreamType::Subtitle, "eng", "subrip"),
+                ],
+                remux: Some(api::MediaSourceRemuxInfo {
+                    source: Some(api::ProbeOrigin::Ffprobe),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        stream
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let resp = server
+            .get(&format!("/items/{}", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("Fields", "MediaSources")])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let source = &body["MediaSources"][0];
+        let name = source["Name"]
+            .as_str()
+            .unwrap();
+        assert!(name.ends_with(" | Audio: JA | Subs: EN"), "{name}");
+        assert!(
+            source["MediaStreams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["Type"] != "Subtitle"),
+            "the detail page still hides subtitle tracks"
         );
     }
 
